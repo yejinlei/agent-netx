@@ -447,7 +447,11 @@ func (r *Registry) register() {
 		if strings.TrimSpace(ans) == "" {
 			return "(用户未作答)"
 		}
-		return ans
+		// Prefix with the question so the LLM can associate the tool result
+		// with the ask_human call it just made. Without this the LLM receives
+		// a bare string like "n2n" and doesn't recognize it as the answer —
+		// leading it to re-ask the same question (the "重复提问" bug).
+		return "👤 你问: " + question + "\n   用户回答: " + ans
 	}
 
 	// recall: surface remembered facts so the LLM can reuse prior knowledge.

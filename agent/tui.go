@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -104,7 +105,8 @@ type tui struct {
 	tools        int
 	store        *SessionStore
 	session      *Session
-	pendingAnswer string // set by tuiAsk so the main loop renders the answer once under "你 >"
+	pendingAnswer    string
+	interruptedInput string
 }
 
 func newTUI(ctx context.Context, cfg Config) *tui {
@@ -981,6 +983,13 @@ func (t *tui) tuiAsk() askFunc {
 	}
 }
 
+// ErrInterrupted is returned when the user hits Ctrl-C or Enter (with typed
+// input) while the LLM is thinking. The main loop treats it as "cancel this
+// turn and return to prompt" rather than as a fatal error.
+var ErrInterrupted = errors.New("interrupted by user")
+
+func IsInterrupted(err error) bool { return errors.Is(err, ErrInterrupted) }
+
 func (t *tui) thinkLoop(ctx context.Context, rawMode bool) (Message, error) {
 	if !rawMode {
 		fmt.Print(sThinking.Render("  AI 思考中 ..."))
@@ -989,7 +998,72 @@ func (t *tui) thinkLoop(ctx context.Context, rawMode bool) (Message, error) {
 		return msg, err
 	}
 
+	// Context that the stdin goroutine can cancel so the LLM HTTP request
+	// is aborted immediately instead of waiting for the request to finish.
+	cancelCtx, cancel := context.WithCancel(ctx)
+
+	// Channel the stdin goroutine uses to hand back any buffered input
+	// the user typed before hitting Enter. Buffered so the sender doesn't
+	// block after we've already cancelled.
+	inputCh := make(chan []byte, 1)
 	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		var buf []byte
+		promptShown := false
+		for {
+			select {
+			case <-cancelCtx.Done():
+				return
+			default:
+			}
+			one := make([]byte, 1)
+			n, err := os.Stdin.Read(one)
+			if err != nil || n == 0 {
+				return
+			}
+			b := one[0]
+			switch {
+			case b == 13 || b == 10: // Enter
+				// Drain any trailing bytes left in the kernel buffer.
+				drain := make([]byte, 128)
+				os.Stdin.Read(drain)
+				select {
+				case inputCh <- buf:
+				default:
+				}
+				cancel()
+				return
+			case b == 3: // Ctrl-C
+				cancel()
+				return
+			case b == 4: // Ctrl-D
+				inputCh <- buf
+				cancel()
+				return
+			case b == 127 || b == 8: // backspace
+				if len(buf) > 0 {
+					buf = buf[:len(buf)-1]
+					fmt.Print("\b \b")
+				}
+			default:
+				if b >= 32 {
+					if !promptShown {
+						// First key pressed while thinking: clear the spinner
+						// line and render a fresh "你 > " so the user can see
+						// what they're typing.
+						promptShown = true
+						fmt.Printf("\r%s\n", ClearLn)
+						fmt.Print(sPrompt.Render("你 > "))
+					}
+					buf = append(buf, b)
+					fmt.Print(string(rune(b)))
+				}
+			}
+		}
+	}()
+
 	frames := []string{"⠋", "⠕", "⠙", "⠘", "⠼", "⠴", "⠆", "⠇", "⠇", "⠏"}
 	go func() {
 		ticker := time.NewTicker(90 * time.Millisecond)
@@ -998,20 +1072,50 @@ func (t *tui) thinkLoop(ctx context.Context, rawMode bool) (Message, error) {
 		i := 0
 		for {
 			select {
+			case <-cancelCtx.Done():
+				return
 			case <-ticker.C:
 				fmt.Print(sThinking.Render(frames[i%len(frames)]))
 				i++
-			case <-done:
-				return
 			}
 		}
 	}()
 
-	msg, err := t.llm.Complete(ctx, t.msgs)
-	close(done)
+	msg, err := t.llm.Complete(cancelCtx, t.msgs)
+	cancel()
+	<-done
+
+	// Clear the spinner line (and the echo line if the user typed anything).
 	fmt.Printf("\033[8m\r%s\r", ClearLn)
+	if promptRenderedDuringThink() {
+		fmt.Printf("\033[1A\r%s\r", ClearLn)
+	}
+
+	// Pull back any typed input.
+	var typed []byte
+	select {
+	case typed = <-inputCh:
+	default:
+	}
+	if len(typed) > 0 {
+		t.interruptedInput = string(typed)
+		return Message{}, ErrInterrupted
+	}
+	if err == context.Canceled || err == context.DeadlineExceeded {
+		return Message{}, ErrInterrupted
+	}
 	return msg, err
 }
+
+// promptRenderedDuringThink tracks whether the stdin goroutine rendered a
+// "你 > " line while we were thinking. We need this so thinkLoop can clear
+// both the spinner line AND the echo line before returning.
+var didPromptDuringThink bool
+
+func promptRenderedDuringThink() bool {
+	return didPromptDuringThink
+}
+
 
 func RunTUI(ctx context.Context, cfg Config) error {
 	t := newTUI(ctx, cfg)
