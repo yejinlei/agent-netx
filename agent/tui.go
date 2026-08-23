@@ -54,10 +54,7 @@ var (
 
 func init() {
 	initStyles()
-	if w, h, err := term.GetSize(int(os.Stdout.Fd())); err == nil {
-		termHeight = h
-		termWidth = w
-	}
+	termWidth, termHeight = getVisibleTerminalSize()
 }
 
 func initStyles() {
@@ -71,7 +68,7 @@ func initStyles() {
 
 	sHeaderBar = lipgloss.NewStyle().Foreground(cy).Bold(true)
 	sTitle = lipgloss.NewStyle().Foreground(ye).Bold(true)
-	sSubtitle = lipgloss.NewStyle().Foreground(dm)
+	sSubtitle = lipgloss.NewStyle().Foreground(gr)
 	sStatusBar = lipgloss.NewStyle().
 		Foreground(dm).
 		Background(cy).
@@ -107,6 +104,7 @@ type tui struct {
 	session      *Session
 	pendingAnswer    string
 	interruptedInput string
+	inputBuf       []byte
 }
 
 func newTUI(ctx context.Context, cfg Config) *tui {
@@ -469,7 +467,13 @@ func (t *tui) sessionsList() {
 }
 
 func (t *tui) run(ctx context.Context) error {
+	enableVT()
+	flushStdout()
+	fmt.Printf("\033[2J\033[1;1H")
+	fmt.Printf("\033[1;%dr", termHeight-2)
+	flushStdout()
 	t.renderHeader()
+	flushStdout()
 	t.renderUpdateBanner(ctx)
 
 	rawMode := term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd()))
@@ -479,6 +483,10 @@ func (t *tui) run(ctx context.Context) error {
 			rawMode = false
 		} else {
 			defer func() { term.Restore(int(os.Stdin.Fd()), oldState) }()
+			// Windows: term.MakeRaw resets console mode (drops VT flags).
+			// Re-enable so ANSI escapes keep working inside the TUI.
+			enableVT()
+		flushStdout()
 			fmt.Print(HideCursor)
 			defer fmt.Print(ShowCursor)
 			// TUI took stdin into raw mode — the init-time askFunc (from
@@ -532,6 +540,7 @@ func (t *tui) run(ctx context.Context) error {
 				t.history = append(t.history, line)
 				t.histIdx = len(t.history)
 				t.renderStatusBar()
+			flushStdout()
 				continue
 			}
 		}
@@ -550,14 +559,22 @@ func (t *tui) run(ctx context.Context) error {
 		for {
 			assistant, err := t.thinkLoop(ctx, rawMode)
 			if err != nil {
+				fmt.Printf("\033[%d;1H", termHeight-2)
+				flushStdout()
 				fmt.Println(t.renderError("⚠ " + err.Error()))
+				fmt.Printf("\033[%d;1H", termHeight-1)
+				flushStdout()
 				t.msgs = t.msgs[:len(t.msgs)-1]
 				break
 			}
 			t.msgs = append(t.msgs, assistant)
 			if len(assistant.ToolCalls) == 0 {
 				if assistant.Content != "" {
+					fmt.Printf("\033[%d;1H", termHeight-2)
+				flushStdout()
 					t.renderAILine(assistant.Content)
+					fmt.Printf("\033[%d;1H", termHeight-1)
+				flushStdout()
 				}
 				break
 			}
@@ -565,10 +582,15 @@ func (t *tui) run(ctx context.Context) error {
 				t.tools++
 				args := ParseToolCallArgs(tc.Function.Arguments)
 				argsStr := compactArgs(args)
+				fmt.Printf("\033[%d;1H", termHeight-2)
+				flushStdout()
 				fmt.Println("  " + t.renderToolCall(tc.Function.Name, argsStr))
+				fmt.Printf("\033[%d;1H", termHeight-1)
+				flushStdout()
 				result := t.registry.Call(ctx, tc.Function.Name, args)
 				if result != "" {
 					t.renderToolResult(result)
+				flushStdout()
 				}
 				t.msgs = append(t.msgs, Message{
 					Role:       RoleTool,
@@ -585,46 +607,16 @@ func (t *tui) run(ctx context.Context) error {
 }
 
 func (t *tui) renderHeader() {
-	w := termWidth - 2
-	if w < 60 {
-		w = 60
-	}
-
 	ver := cmdVersion()
-	wd, _ := os.Getwd()
-	if wd == "" {
-		wd = "."
-	}
-	sessLabel := "session_" + shortUUID()
-	if t.session != nil {
-		id := t.session.ID
-		if len(id) > 24 {
-			id = id[:24] + "…"
-		}
-		sessLabel = id + " · " + t.session.Name
-	}
-
-	title := sTitle.Render("  Welcome to agent-netx!")
-	verLine := sSubtitle.Render("  Version:   ") + sVersion.Render(ver)
-	dirLine := sSubtitle.Render("  Directory: ") + wd
-	sessLine := sSubtitle.Render("  Session:   ") + sStatusVal.Render(sessLabel)
-	modelLine := sStatusKey.Render("  model:") + " " + sStatusVal.Render(t.cfg.Model) +
+	title := sTitle.Render("agent-netx") + " " + sVersion.Render(ver) +
+		"    " + sSubtitle.Render("按 /help 查看命令")
+	meta := sStatusKey.Render("model:") + " " + sStatusVal.Render(t.cfg.Model) +
 		"   ·   " + sStatusKey.Render("base:") + " " + sStatusVal.Render(shortBaseURL(t.cfg.BaseURL))
-	helpLine := sSubtitle.Render("  Send ") + sStatusVal.Render("/help") + sSubtitle.Render(" for help information.")
-
-	content := title + "\n" + dirLine + "\n" + sessLine + "\n" + verLine + "\n" + modelLine + "\n" + helpLine
-
-	fmt.Println()
-	fmt.Println(sHeaderBar.Render("┌" + strings.Repeat("─", w) + "┐"))
-
-	lines := strings.Split(content, "\n")
-	for _, ln := range lines {
-		padded := ln + strings.Repeat(" ", w-printableLen(ln))
-		fmt.Println(sHeaderBar.Render("│") + padded + sHeaderBar.Render("│"))
-	}
-	fmt.Println(sHeaderBar.Render("└" + strings.Repeat("─", w) + "┘"))
-	fmt.Println()
+	fmt.Println(title)
+	fmt.Println(meta)
 }
+
+
 
 func (t *tui) renderUpdateBanner(ctx context.Context) {
 	cur := cmdVersion()
@@ -730,8 +722,8 @@ func (t *tui) renderStatusBar() {
 		bar += " "
 	}
 	fmt.Printf("\033[%d;1H", termHeight)
-	fmt.Printf("\033[1A")
-	fmt.Print(bar + "\n")
+	fmt.Print(bar)
+	flushStdout()
 }
 
 func (t *tui) renderUserLine(line string) {
@@ -740,11 +732,18 @@ func (t *tui) renderUserLine(line string) {
 }
 
 func (t *tui) renderAILine(content string) {
-	for _, l := range wrapLines(content, termWidth-12) {
-		fmt.Println(sAiRail.Render("AI  ") + sAiText.Render(l))
+	lines := wrapLines(content, termWidth-12)
+	for i, l := range lines {
+		if i == 0 {
+			fmt.Println(sAiRail.Render("AI  ") + sAiText.Render(l))
+		} else {
+			fmt.Println(sAiRail.Render("    ") + sAiText.Render(l))
+		}
 	}
 	fmt.Println()
 }
+
+
 
 func (t *tui) renderToolCall(name, args string) string {
 	if args == "" {
@@ -752,19 +751,77 @@ func (t *tui) renderToolCall(name, args string) string {
 	}
 	return sToolIcon.Render("⚙ ") + sToolName.Render(name) + sToolArgs.Render("("+args+")")
 }
-
 func (t *tui) renderToolResult(result string) {
+	if !term.IsTerminal(int(os.Stdout.Fd())) {
+		out := result
+		if len(out) > 400 {
+			out = out[:400] + "\n…(截断)"
+		}
+		for i, l := range strings.Split(out, "\n") {
+			prefix := "     └─"
+			if i > 0 {
+				prefix = "     │ "
+			}
+			fmt.Println(sToolResult.Render(prefix + " " + l))
+		}
+		return
+	}
 	preview := result
 	if len(preview) > 400 {
 		preview = preview[:400] + "\n…(截断)"
 	}
+	scrollBottom := termHeight - 1 - t.inputHeight()
+	promptRow    := termHeight - 1
 	for i, l := range strings.Split(preview, "\n") {
 		prefix := "     └─"
 		if i > 0 {
 			prefix = "     │ "
 		}
+		fmt.Printf("\033[%d;1H", scrollBottom)
 		fmt.Println(sToolResult.Render(prefix + " " + l))
+		}
+		fmt.Printf("\033[%d;1H", promptRow)
+}
+func (t *tui) inputHeight() int {
+	n := len(t.inputBuf)
+	count := 1
+	for i := 0; i < n; i++ {
+		if t.inputBuf[i] == '\n' {
+			count++
+		}
 	}
+	return count
+}
+
+func inputPrefix(n int) string {
+	if n == 1 {
+		return "  你 > "
+	}
+	return "  │   "
+}
+
+func (t *tui) redrawInputBox() {
+	txt := string(t.inputBuf)
+	lines := strings.Split(txt, "\n")
+	wrap := len(lines)
+	if wrap < 1 {
+		wrap = 1
+	}
+	bottom := termHeight - 1
+	top := bottom - wrap + 1
+	scrollEnd := top - 1
+	newRegion := fmt.Sprintf("\033[1;%dr", scrollEnd)
+	oldRegion := fmt.Sprintf("\033[1;%dr", termHeight-2)
+	if newRegion != oldRegion {
+		fmt.Print(newRegion)
+		flushStdout()
+	}
+	for i, line := range lines {
+		row := bottom - (wrap - 1 - i)
+		fmt.Printf("\033[%d;1H\033[2K", row)
+		fmt.Print(sPrompt.Render(inputPrefix(wrap-i)) + line)
+	}
+	flushStdout()
 }
 
 func (t *tui) renderError(s string) string {
@@ -772,7 +829,8 @@ func (t *tui) renderError(s string) string {
 }
 
 func (t *tui) renderPrompt(line string) {
-	fmt.Print(sPrompt.Render("你 > ") + line)
+	t.inputBuf = []byte(line)
+	t.redrawInputBox()
 }
 
 func (t *tui) renderGoodbye() {
@@ -808,10 +866,8 @@ func (t *tui) readLine(rawMode bool) (string, error) {
 		return "", io.EOF
 	}
 
-	// Raw mode — must be UTF-8 aware: CJK chars are 3-4 bytes; reading
-	// one byte at a time and treating each as a char (the old code) corrupts
-	// Chinese input and makes backspace delete only one of three bytes.
-	var buf []byte
+	// Raw mode: t.inputBuf tracks current input; redrawInputBox renders it.
+	t.inputBuf = nil
 loop:
 	for {
 		runeBytes, err := readUtf8Rune(os.Stdin)
@@ -820,7 +876,8 @@ loop:
 		}
 		switch runeBytes[0] {
 		case 9: // TAB
-			t.completeTab(&buf)
+			t.completeTab(&t.inputBuf)
+			t.redrawInputBox()
 			continue
 		case 13:
 			break loop
@@ -831,10 +888,10 @@ loop:
 		case 3:
 			return "", fmt.Errorf("cancelled")
 		case 127, 8:
-			if len(buf) > 0 {
-				_, sz := utf8.DecodeLastRune(buf)
-				buf = buf[:len(buf)-sz]
-				fmt.Printf("\r%s%s", ClearLn, sPrompt.Render("你 > ")+string(buf)+" ")
+			if len(t.inputBuf) > 0 {
+				_, sz := utf8.DecodeLastRune(t.inputBuf)
+				t.inputBuf = t.inputBuf[:len(t.inputBuf)-sz]
+				t.redrawInputBox()
 			}
 		case 27:
 			inner := make([]byte, 3)
@@ -843,11 +900,8 @@ loop:
 				continue
 			}
 			if inner[0] == 13 {
-				// Alt+Enter (ESC + \r) -> insert newline so the user can type
-				// multiline content. Plain Enter still ends the line.
-				buf = append(buf, '\n')
-				fmt.Println()
-				fmt.Print(sPrompt.Render("    "))
+				t.inputBuf = append(t.inputBuf, '\n')
+				t.redrawInputBox()
 				continue
 			}
 			if inner[0] != '[' {
@@ -861,45 +915,43 @@ loop:
 			case 'A':
 				if len(t.history) > 0 && t.histIdx > 0 {
 					t.histIdx--
-					buf = []byte(t.history[t.histIdx])
-					fmt.Printf("\r%s%s", ClearLn, sPrompt.Render("你 > ")+string(buf))
+					t.inputBuf = []byte(t.history[t.histIdx])
+					t.redrawInputBox()
 				}
 			case 'B':
 				if t.histIdx < len(t.history) {
 					t.histIdx++
 					if t.histIdx < len(t.history) {
-						buf = []byte(t.history[t.histIdx])
-						fmt.Printf("\r%s%s", ClearLn, sPrompt.Render("你 > ")+string(buf))
+						rawHist := t.history[t.histIdx]
+						t.inputBuf = []byte(rawHist)
+						t.redrawInputBox()
 					} else {
-						// Past the newest entry → blank prompt so the user
-						// can type a fresh command.
-						buf = nil
-						fmt.Printf("\r%s%s", ClearLn, sPrompt.Render("你 > "))
+						t.inputBuf = nil
+						t.redrawInputBox()
 					}
 				}
 			case 'D':
-				if len(buf) == 0 {
+				if len(t.inputBuf) == 0 {
 					return "", io.EOF
 				}
-				_, sz := utf8.DecodeLastRune(buf)
-				buf = buf[:len(buf)-sz]
-				fmt.Printf("\r%s%s", ClearLn, sPrompt.Render("你 > ")+string(buf)+" ")
+				_, sz := utf8.DecodeLastRune(t.inputBuf)
+				t.inputBuf = t.inputBuf[:len(t.inputBuf)-sz]
+				t.redrawInputBox()
 			case 'H':
-				if len(buf) > 0 {
-					_, sz := utf8.DecodeLastRune(buf)
-					buf = buf[:len(buf)-sz]
-					fmt.Printf("\r%s%s", ClearLn, sPrompt.Render("你 > ")+string(buf)+" ")
+				if len(t.inputBuf) > 0 {
+					_, sz := utf8.DecodeLastRune(t.inputBuf)
+					t.inputBuf = t.inputBuf[:len(t.inputBuf)-sz]
+					t.redrawInputBox()
 				}
 			}
 		default:
 			if runeBytes[0] >= 32 {
-				buf = append(buf, runeBytes...)
-				fmt.Print(string(runeBytes))
+				t.inputBuf = append(t.inputBuf, runeBytes...)
+				t.redrawInputBox()
 			}
 		}
 	}
-	fmt.Println()
-	return string(buf), nil
+	return string(t.inputBuf), nil
 }
 
 // readUtf8Rune reads a single UTF-8 rune (1-4 bytes) from r. In raw mode
@@ -947,18 +999,21 @@ func (t *tui) tuiAsk() askFunc {
 			runeBytes, err := readUtf8Rune(os.Stdin)
 			if err != nil {
 				fmt.Println()
+				t.renderStatusBar()
 				return string(buf)
 			}
 			ch := runeBytes[0]
 			switch {
 			case ch == 13, ch == 10: // Enter
 				fmt.Println()
+				t.renderStatusBar()
 				// Set pending answer so the main loop renders the answer once
 				// under "你 > " — prevents the "user has to enter twice" bug.
 				t.pendingAnswer = string(buf)
 				return string(buf)
 			case ch == 4, ch == 3: // Ctrl-D / Ctrl-C
 				fmt.Println()
+				t.renderStatusBar()
 				return ""
 			case ch == 127, ch == 8: // backspace
 				if len(buf) > 0 {
@@ -991,6 +1046,7 @@ var ErrInterrupted = errors.New("interrupted by user")
 func IsInterrupted(err error) bool { return errors.Is(err, ErrInterrupted) }
 
 func (t *tui) thinkLoop(ctx context.Context, rawMode bool) (Message, error) {
+	didPromptDuringThink = false
 	if !rawMode {
 		fmt.Print(sThinking.Render("  AI 思考中 ..."))
 		msg, err := t.llm.Complete(ctx, t.msgs)
@@ -1054,6 +1110,7 @@ func (t *tui) thinkLoop(ctx context.Context, rawMode bool) (Message, error) {
 						// line and render a fresh "你 > " so the user can see
 						// what they're typing.
 						promptShown = true
+						didPromptDuringThink = true
 						fmt.Printf("\r%s\n", ClearLn)
 						fmt.Print(sPrompt.Render("你 > "))
 					}

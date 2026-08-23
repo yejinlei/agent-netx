@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"agent-netx/config"
@@ -649,8 +650,10 @@ netdiag    查看进程网络端口和数据包（netstat / ss / tcpdump 等价�
 			return "(暂无会话)"
 		}
 		var sb strings.Builder
-		fmt.Fprintf(&sb, "共 %d 个会话:\n", len(all))
-		for _, s := range all {
+		fmt.Fprintf(&sb, "共 %d 个会话 (按修改时间降序):\n", len(all))
+		fmt.Fprintf(&sb, "  %-4s  %-26s  %-30s  %s  轮次  消息\n",
+			"#", "ID", "名称", "修改时间")
+		for i, s := range all {
 			id := s.ID
 			if len(id) > 24 {
 				id = id[:24] + "…"
@@ -663,8 +666,8 @@ netdiag    查看进程网络端口和数据包（netstat / ss / tcpdump 等价�
 			if msgCnt > 0 {
 				msgCnt--
 			}
-			fmt.Fprintf(&sb, "  %-26s  %-30s  %s  轮次 %d  消息 %d\n",
-				id, name,
+			fmt.Fprintf(&sb, "  #%-3d  %-26s  %-30s  %s  %2d    %2d\n",
+				i+1, id, name,
 				s.UpdatedAt.Local().Format("2006-01-02 15:04"),
 				s.Turns, msgCnt)
 		}
@@ -693,8 +696,25 @@ netdiag    查看进程网络端口和数据包（netstat / ss / tcpdump 等价�
 			limit = 20
 		}
 		store := NewSessionStore("")
+
+		// Numeric index like "2" (from session_list "#2") resolves against
+		// the current session list (sorted by updatedAt desc). Strip leading
+		// "#" if the LLM passes it along.
+		trimmed := strings.TrimLeft(idOrName, "# ")
+		var idx int
+		if n, err := strconv.Atoi(trimmed); err == nil && n >= 1 {
+			all, err := store.List()
+			if err == nil && n <= len(all) {
+				idOrName = all[n-1].ID
+			}
+			idx = n
+		}
+
 		s, err := store.Load(idOrName)
 		if err != nil {
+			if idx > 0 {
+				return fmt.Sprintf("error: 第 %d 个会话加载失败 (%v),试试 /sessions 查看列表或重新指定 id/name", idx, err)
+			}
 			return "error: " + err.Error()
 		}
 		msgs := s.Messages
@@ -708,8 +728,13 @@ netdiag    查看进程网络端口和数据包（netstat / ss / tcpdump 等价�
 			return fmt.Sprintf("会话 %s (%s): 无消息", s.Name, s.ID)
 		}
 		var sb strings.Builder
-		fmt.Fprintf(&sb, "会话 %s (%s) — 共 %d 条, 显示最近 %d 条:\n",
-			s.Name, s.ID, len(s.Messages), len(msgs))
+		if idx > 0 {
+			fmt.Fprintf(&sb, "会话 #%d %s (%s) — 共 %d 条, 显示最近 %d 条:\n",
+				idx, s.Name, s.ID, len(s.Messages), len(msgs))
+		} else {
+			fmt.Fprintf(&sb, "会话 %s (%s) — 共 %d 条, 显示最近 %d 条:\n",
+				s.Name, s.ID, len(s.Messages), len(msgs))
+		}
 		for _, m := range msgs {
 			content := strings.TrimSpace(m.Content)
 			if len(content) > 200 {
