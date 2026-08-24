@@ -751,7 +751,7 @@ func (t *tui) renderToolResult(result string) {
 	if !term.IsTerminal(int(os.Stdout.Fd())) {
 		out := result
 		if len(out) > 400 {
-			out = out[:400] + "\n…(截断)"
+			out = out[:400] + "\n…截断)"
 		}
 		for i, l := range strings.Split(out, "\n") {
 			prefix := "     └─"
@@ -764,16 +764,16 @@ func (t *tui) renderToolResult(result string) {
 	}
 	preview := result
 	if len(preview) > 400 {
-		preview = preview[:400] + "\n…(截断)"
+		preview = preview[:400] + "\n…截断)"
 	}
-	scrollBottom := termHeight - 1 - t.inputHeight()
-	promptRow := termHeight - 1
+	scrollBottom := termHeight - 2
+	promptRow    := termHeight
+	fmt.Printf("\033[%d;1H", scrollBottom)
 	for i, l := range strings.Split(preview, "\n") {
 		prefix := "     └─"
 		if i > 0 {
 			prefix = "     │ "
 		}
-		fmt.Printf("\033[%d;1H", scrollBottom)
 		fmt.Println(sToolResult.Render(prefix + " " + l))
 	}
 	fmt.Printf("\033[%d;1H", promptRow)
@@ -803,20 +803,21 @@ func (t *tui) redrawInputBox() {
 	if wrap < 1 {
 		wrap = 1
 	}
-	bottom := termHeight - 1
+	bottom := termHeight
 	top := bottom - wrap + 1
-	scrollEnd := top - 1
-	newRegion := fmt.Sprintf("\033[3;%dr", scrollEnd)
-	oldRegion := fmt.Sprintf("\033[3;%dr", termHeight-2)
-	if newRegion != oldRegion {
-		fmt.Print(newRegion)
-		flushStdout()
+	const bodyTop = 3
+	if top < bodyTop {
+		drop := bodyTop - top
+		lines = lines[drop:]
+		wrap = len(lines)
+		top = bodyTop
 	}
 	for i, line := range lines {
 		row := bottom - (wrap - 1 - i)
 		fmt.Printf("\033[%d;1H\033[2K", row)
 		fmt.Print(sPrompt.Render(inputPrefix(wrap-i)) + line)
 	}
+	fmt.Printf("\033[%d;1H", bottom)
 	flushStdout()
 }
 
