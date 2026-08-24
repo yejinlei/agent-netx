@@ -89,22 +89,22 @@ func initStyles() {
 }
 
 type tui struct {
-	cfg          Config
-	ctx          context.Context
-	mem          *Memory
-	registry     *Registry
-	llm          *LLM
-	msgs         []Message
-	history      []string
-	histIdx      int
-	tabIdx       int
-	turns        int
-	tools        int
-	store        *SessionStore
-	session      *Session
+	cfg              Config
+	ctx              context.Context
+	mem              *Memory
+	registry         *Registry
+	llm              *LLM
+	msgs             []Message
+	history          []string
+	histIdx          int
+	tabIdx           int
+	turns            int
+	tools            int
+	store            *SessionStore
+	session          *Session
 	pendingAnswer    string
 	interruptedInput string
-	inputBuf       []byte
+	inputBuf         []byte
 }
 
 func newTUI(ctx context.Context, cfg Config) *tui {
@@ -163,35 +163,35 @@ func (t *tui) saveCurrentSession() {
 // "requires-config" subcommands need -c; "no-config" subcommands (init, status,
 // ping, use, etc.) don't take -c or can run without a config file.
 var cliSubcommands = []struct {
-	name string
+	name  string
 	noCfg bool
 	usage string
 }{
-	{"/init",        true,  "生成示例配置到当前目录"},
-	{"/status",      true,  "显示当前配置"},
-	{"/ping",        true,  "测试代理延迟: /ping [url] [--proxy <url>]"},
-	{"/use",         true,  "切换手动分组: /use <group> <proxy>"},
-	{"/sysproxy",    false, "系统代理: /sysproxy on|off|status [addr]"},
-	{"/start",       false, "启动所有启用的服务"},
-	{"/proxy",       false, "仅启动 HTTP/SOCKS5 代理"},
-	{"/dns",         false, "仅启动本地 DNS"},
-	{"/web",         false, "仅启动 Web 仪表盘"},
-	{"/tun",         false, "仅启动 TUN 设备"},
-	{"/n2n",         false, "仅启动 n2n 虚拟局域网节点"},
-	{"/stunvpv",     false, "仅启动 STUN/TURN VPN 节点"},
-	{"/wireguard",   false, "启动 WireGuard 隧道"},
-	{"/frp",         false, "启动 FRP 代理"},
-	{"/tinc",        false, "启动 Tinc 隧道"},
-	{"/socat",       false, "启动 Socat 转发"},
-	{"/corsproxy",   false, "启动 CORS 代理"},
-	{"/forward",     false, "端口转发 (-L/-R/-D/-U/tls)"},
-	{"/scp",         true,  "SSH 文件拷贝"},
-	{"/run",         true,  "本地/远端执行命令: /run local|remote --cmd <cmd> [--alias/--host]"},
-	{"/netdiag",     true,  "网络诊断: /netdiag conns|listeners|stats|packets"},
-	{"/logs",        true,  "运行时日志: /logs [n]"},
-	{"/validate",    true,  "校验配置文件"},
-	{"/stop",        false, "停止子服务: /stop proxy|dns|...|all"},
-	{"/restart",     false, "重启子服务: /restart proxy|dns|...|all"},
+	{"/init", true, "生成示例配置到当前目录"},
+	{"/status", true, "显示当前配置"},
+	{"/ping", true, "测试代理延迟: /ping [url] [--proxy <url>]"},
+	{"/use", true, "切换手动分组: /use <group> <proxy>"},
+	{"/sysproxy", false, "系统代理: /sysproxy on|off|status [addr]"},
+	{"/start", false, "启动所有启用的服务"},
+	{"/proxy", false, "仅启动 HTTP/SOCKS5 代理"},
+	{"/dns", false, "仅启动本地 DNS"},
+	{"/web", false, "仅启动 Web 仪表盘"},
+	{"/tun", false, "仅启动 TUN 设备"},
+	{"/n2n", false, "仅启动 n2n 虚拟局域网节点"},
+	{"/stunvpv", false, "仅启动 STUN/TURN VPN 节点"},
+	{"/wireguard", false, "启动 WireGuard 隧道"},
+	{"/frp", false, "启动 FRP 代理"},
+	{"/tinc", false, "启动 Tinc 隧道"},
+	{"/socat", false, "启动 Socat 转发"},
+	{"/corsproxy", false, "启动 CORS 代理"},
+	{"/forward", false, "端口转发 (-L/-R/-D/-U/tls)"},
+	{"/scp", true, "SSH 文件拷贝"},
+	{"/run", true, "本地/远端执行命令: /run local|remote --cmd <cmd> [--alias/--host]"},
+	{"/netdiag", true, "网络诊断: /netdiag conns|listeners|stats|packets"},
+	{"/logs", true, "运行时日志: /logs [n]"},
+	{"/validate", true, "校验配置文件"},
+	{"/stop", false, "停止子服务: /stop proxy|dns|...|all"},
+	{"/restart", false, "重启子服务: /restart proxy|dns|...|all"},
 }
 
 func (t *tui) dispatchCLIShortcut(line string) bool {
@@ -269,38 +269,38 @@ func (t *tui) showAllCommands() {
 	fmt.Println()
 	fmt.Println(sSubtitle.Render("  ── CLI 快捷命令 (映射到 agent-netx 子命令) ──"))
 	fmt.Println()
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/init"),        "生成示例配置到当前目录")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/status"),      "显示当前配置")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/ping"),        "测试代理延迟 (/ping [url] [--proxy <url>])")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/use"),         "切换手动分组")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/sysproxy"),    "系统代理 on/off/status")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/start"),       "启动所有启用的服务")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/proxy"),       "仅启动 HTTP/SOCKS5 代理")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/dns"),         "仅启动本地 DNS")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/web"),         "仅启动 Web 仪表盘")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/tun"),         "仅启动 TUN 设备")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/n2n"),         "仅启动 n2n 虚拟局域网")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/stunvpv"),     "仅启动 STUN/TURN VPN")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/wireguard"),   "启动 WireGuard 隧道")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/frp"),         "启动 FRP 代理")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/tinc"),        "启动 Tinc 隧道")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/socat"),       "启动 Socat 转发")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/corsproxy"),   "启动 CORS 代理")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/forward"),     "端口转发 (-L/-R/-D/-U/tls)")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/scp"),         "SSH 文件拷贝")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/run"),         "本地/远端执行命令")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/netdiag"),     "网络诊断 (conns/listeners/stats/packets)")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/logs"),        "运行时日志 (/logs [n] /logs follow)")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/validate"),    "校验配置文件")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/stop"),        "停止子服务 (/stop <name>|all)")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/restart"),     "重启子服务 (/restart <name>|all)")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/init"), "生成示例配置到当前目录")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/status"), "显示当前配置")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/ping"), "测试代理延迟 (/ping [url] [--proxy <url>])")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/use"), "切换手动分组")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/sysproxy"), "系统代理 on/off/status")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/start"), "启动所有启用的服务")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/proxy"), "仅启动 HTTP/SOCKS5 代理")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/dns"), "仅启动本地 DNS")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/web"), "仅启动 Web 仪表盘")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/tun"), "仅启动 TUN 设备")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/n2n"), "仅启动 n2n 虚拟局域网")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/stunvpv"), "仅启动 STUN/TURN VPN")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/wireguard"), "启动 WireGuard 隧道")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/frp"), "启动 FRP 代理")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/tinc"), "启动 Tinc 隧道")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/socat"), "启动 Socat 转发")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/corsproxy"), "启动 CORS 代理")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/forward"), "端口转发 (-L/-R/-D/-U/tls)")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/scp"), "SSH 文件拷贝")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/run"), "本地/远端执行命令")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/netdiag"), "网络诊断 (conns/listeners/stats/packets)")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/logs"), "运行时日志 (/logs [n] /logs follow)")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/validate"), "校验配置文件")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/stop"), "停止子服务 (/stop <name>|all)")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/restart"), "重启子服务 (/restart <name>|all)")
 	fmt.Println()
 	fmt.Println(sSubtitle.Render("  ── 会话扩展命令 (Agent 工具直连) ──"))
 	fmt.Println()
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/add-proxy"),   "动态添加代理: /add-proxy <name> <type> <server> <port> [key=val ...]")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/add-rule"),    "动态添加规则: /add-rule <TYPE,PATTERN,TARGET>")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/session-export"),"导出会话: /session-export [<idOrName>] <dst>")
-	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/session-import"),"导入会话: /session-import <src>")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/add-proxy"), "动态添加代理: /add-proxy <name> <type> <server> <port> [key=val ...]")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/add-rule"), "动态添加规则: /add-rule <TYPE,PATTERN,TARGET>")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/session-export"), "导出会话: /session-export [<idOrName>] <dst>")
+	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/session-import"), "导入会话: /session-import <src>")
 	fmt.Println()
 	fmt.Println("  " + sStatusKey.Render("exit / q") + "         退出")
 	fmt.Println()
@@ -470,7 +470,7 @@ func (t *tui) run(ctx context.Context) error {
 	enableVT()
 	flushStdout()
 	fmt.Printf("\033[2J\033[1;1H")
-	fmt.Printf("\033[1;%dr", termHeight-2)
+	fmt.Printf("\033[3;%dr", termHeight-2)
 	flushStdout()
 	t.renderHeader()
 	flushStdout()
@@ -486,7 +486,7 @@ func (t *tui) run(ctx context.Context) error {
 			// Windows: term.MakeRaw resets console mode (drops VT flags).
 			// Re-enable so ANSI escapes keep working inside the TUI.
 			enableVT()
-		flushStdout()
+			flushStdout()
 			fmt.Print(HideCursor)
 			defer fmt.Print(ShowCursor)
 			// TUI took stdin into raw mode — the init-time askFunc (from
@@ -540,7 +540,7 @@ func (t *tui) run(ctx context.Context) error {
 				t.history = append(t.history, line)
 				t.histIdx = len(t.history)
 				t.renderStatusBar()
-			flushStdout()
+				flushStdout()
 				continue
 			}
 		}
@@ -571,10 +571,10 @@ func (t *tui) run(ctx context.Context) error {
 			if len(assistant.ToolCalls) == 0 {
 				if assistant.Content != "" {
 					fmt.Printf("\033[%d;1H", termHeight-2)
-				flushStdout()
+					flushStdout()
 					t.renderAILine(assistant.Content)
 					fmt.Printf("\033[%d;1H", termHeight-1)
-				flushStdout()
+					flushStdout()
 				}
 				break
 			}
@@ -590,7 +590,7 @@ func (t *tui) run(ctx context.Context) error {
 				result := t.registry.Call(ctx, tc.Function.Name, args)
 				if result != "" {
 					t.renderToolResult(result)
-				flushStdout()
+					flushStdout()
 				}
 				t.msgs = append(t.msgs, Message{
 					Role:       RoleTool,
@@ -612,11 +612,9 @@ func (t *tui) renderHeader() {
 		"    " + sSubtitle.Render("按 /help 查看命令")
 	meta := sStatusKey.Render("model:") + " " + sStatusVal.Render(t.cfg.Model) +
 		"   ·   " + sStatusKey.Render("base:") + " " + sStatusVal.Render(shortBaseURL(t.cfg.BaseURL))
-	fmt.Println(title)
-	fmt.Println(meta)
+	fmt.Printf("\033[1;1H\033[2K%s", title)
+	fmt.Printf("\033[2;1H\033[2K%s", meta)
 }
-
-
 
 func (t *tui) renderUpdateBanner(ctx context.Context) {
 	cur := cmdVersion()
@@ -708,10 +706,10 @@ func (t *tui) renderStatusBar() {
 		if len(hosts) > 30 {
 			hosts = hosts[:28] + "…"
 		}
-		parts = append(parts, sStatusKey.Render("ssh") + ":" + sStatusVal.Render(hosts))
+		parts = append(parts, sStatusKey.Render("ssh")+":"+sStatusVal.Render(hosts))
 	}
 	if t.turns > 0 {
-		parts = append(parts, sStatusKey.Render("turns") + ":" + sStatusVal.Render(fmt.Sprintf("%d", t.turns)))
+		parts = append(parts, sStatusKey.Render("turns")+":"+sStatusVal.Render(fmt.Sprintf("%d", t.turns)))
 	}
 	statusText := strings.Join(parts, "   ·   ")
 	if statusText == "" {
@@ -721,7 +719,7 @@ func (t *tui) renderStatusBar() {
 	for lipgloss.Width(bar) < termWidth {
 		bar += " "
 	}
-	fmt.Printf("\033[%d;1H", termHeight)
+	fmt.Printf("\033[%d;1H", termHeight-1)
 	fmt.Print(bar)
 	flushStdout()
 }
@@ -742,8 +740,6 @@ func (t *tui) renderAILine(content string) {
 	}
 	fmt.Println()
 }
-
-
 
 func (t *tui) renderToolCall(name, args string) string {
 	if args == "" {
@@ -771,7 +767,7 @@ func (t *tui) renderToolResult(result string) {
 		preview = preview[:400] + "\n…(截断)"
 	}
 	scrollBottom := termHeight - 1 - t.inputHeight()
-	promptRow    := termHeight - 1
+	promptRow := termHeight - 1
 	for i, l := range strings.Split(preview, "\n") {
 		prefix := "     └─"
 		if i > 0 {
@@ -779,8 +775,8 @@ func (t *tui) renderToolResult(result string) {
 		}
 		fmt.Printf("\033[%d;1H", scrollBottom)
 		fmt.Println(sToolResult.Render(prefix + " " + l))
-		}
-		fmt.Printf("\033[%d;1H", promptRow)
+	}
+	fmt.Printf("\033[%d;1H", promptRow)
 }
 func (t *tui) inputHeight() int {
 	n := len(t.inputBuf)
@@ -810,8 +806,8 @@ func (t *tui) redrawInputBox() {
 	bottom := termHeight - 1
 	top := bottom - wrap + 1
 	scrollEnd := top - 1
-	newRegion := fmt.Sprintf("\033[1;%dr", scrollEnd)
-	oldRegion := fmt.Sprintf("\033[1;%dr", termHeight-2)
+	newRegion := fmt.Sprintf("\033[3;%dr", scrollEnd)
+	oldRegion := fmt.Sprintf("\033[3;%dr", termHeight-2)
 	if newRegion != oldRegion {
 		fmt.Print(newRegion)
 		flushStdout()
@@ -1172,7 +1168,6 @@ var didPromptDuringThink bool
 func promptRenderedDuringThink() bool {
 	return didPromptDuringThink
 }
-
 
 func RunTUI(ctx context.Context, cfg Config) error {
 	t := newTUI(ctx, cfg)
