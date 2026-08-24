@@ -751,7 +751,7 @@ func (t *tui) renderToolResult(result string) {
 	if !term.IsTerminal(int(os.Stdout.Fd())) {
 		out := result
 		if len(out) > 400 {
-			out = out[:400] + "\n…截断)"
+			out = out[:400] + "\n…(截断)"
 		}
 		for i, l := range strings.Split(out, "\n") {
 			prefix := "     └─"
@@ -764,7 +764,7 @@ func (t *tui) renderToolResult(result string) {
 	}
 	preview := result
 	if len(preview) > 400 {
-		preview = preview[:400] + "\n…截断)"
+		preview = preview[:400] + "\n…(截断)"
 	}
 	scrollBottom := termHeight - 2
 	promptRow    := termHeight
