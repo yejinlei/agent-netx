@@ -3,10 +3,12 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -17,6 +19,7 @@ import (
 	"agent-netx/router"
 	"agent-netx/web"
 
+	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 )
@@ -34,8 +37,100 @@ var rootCmd = &cobra.Command{
 	Use:   "agent-netx",
 	Short: "A lightweight network proxy client with an LLM agent",
 	Run: func(cmd *cobra.Command, args []string) {
-		cmd.Usage()
+		cmd.Help()
 	},
+}
+
+// flagSep 匹配 FlagUsages 行中 flag 与描述之间的 2+ 空格分隔带；
+// 捕获组前的 \S 确保跳过行首缩进，落在 flag 部分的最后一个非空白字符上。
+var flagSep = regexp.MustCompile(`\S(\s{2,})`)
+
+// styledHelp 用与 TUI 抬头相同的配色（金色标题、青色命令名、淡紫提示）
+// 渲染帮助文档，替代 cobra 默认的黑白模板。设置在 rootCmd 上后会被所有
+// 子命令继承（cobra 沿父链查找 HelpFunc/UsageFunc）。
+func styledHelp(cmd *cobra.Command, _ []string) {
+	out := cmd.OutOrStdout()
+
+	amber := lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Bold(true) // 金：标题
+	spark := lipgloss.NewStyle().Foreground(lipgloss.Color("207"))            // 品红：✻
+	lilac := lipgloss.NewStyle().Foreground(lipgloss.Color("189"))            // 淡紫：描述/提示
+	cyan := lipgloss.NewStyle().Foreground(lipgloss.Color("45")).Bold(true)   // 青：命令名/flag
+	muted := lipgloss.NewStyle().Foreground(lipgloss.Color("250"))            // 亮灰：正文
+	sec := lipgloss.NewStyle().Foreground(lipgloss.Color("177")).Bold(true)   // 亮紫：小节标题
+
+	title := spark.Render("✻") + " " + amber.Render(cmd.CommandPath())
+	if Version != "" && Version != "dev" {
+		title += "  " + muted.Render(Version)
+	}
+	fmt.Fprintln(out, title)
+	desc := cmd.Long
+	if desc == "" {
+		desc = cmd.Short
+	}
+	if desc != "" {
+		fmt.Fprintln(out, lilac.Render(desc))
+	}
+	fmt.Fprintln(out)
+
+	fmt.Fprintln(out, sec.Render("Usage:"))
+	if cmd.Runnable() {
+		fmt.Fprintln(out, "  "+muted.Render(cmd.UseLine()))
+	}
+	if cmd.HasAvailableSubCommands() {
+		fmt.Fprintln(out, "  "+muted.Render(cmd.CommandPath()+" [command]"))
+	}
+	fmt.Fprintln(out)
+
+	if cmd.HasAvailableSubCommands() {
+		fmt.Fprintln(out, sec.Render("Available Commands:"))
+		nameW := 0
+		for _, c := range cmd.Commands() {
+			if !c.IsAvailableCommand() && c.Name() != "help" {
+				continue
+			}
+			if len(c.Name()) > nameW {
+				nameW = len(c.Name())
+			}
+		}
+		for _, c := range cmd.Commands() {
+			if !c.IsAvailableCommand() && c.Name() != "help" {
+				continue
+			}
+			fmt.Fprintf(out, "  %s  %s\n", cyan.Render(fmt.Sprintf("%-*s", nameW, c.Name())), muted.Render(c.Short))
+		}
+		fmt.Fprintln(out)
+	}
+
+	writeFlagBlock(out, sec, cyan, muted, "Flags:", cmd.LocalFlags().FlagUsages())
+	writeFlagBlock(out, sec, cyan, muted, "Global Flags:", cmd.InheritedFlags().FlagUsages())
+
+	if cmd.HasAvailableSubCommands() {
+		fmt.Fprintln(out, lilac.Render(fmt.Sprintf(
+			"Use %q for more information about a command.", cmd.CommandPath()+" [command] --help")))
+	}
+}
+
+// writeFlagBlock 渲染一段 flag 列表：flag 部分青色、描述亮灰，
+// 保留 pflag 原有的列对齐。
+func writeFlagBlock(out io.Writer, sec, cyan, muted lipgloss.Style, title, block string) {
+	block = strings.TrimRight(block, "\n")
+	if block == "" {
+		return
+	}
+	fmt.Fprintln(out, sec.Render(title))
+	for _, ln := range strings.Split(block, "\n") {
+		loc := flagSep.FindStringSubmatchIndex(ln)
+		// flag 行形如 "  -c, --config string   path to config file"；
+		// 续行/无描述行不含 "-" 前缀或分隔带，整体按亮灰输出。
+		if loc != nil && strings.HasPrefix(strings.TrimSpace(ln), "-") {
+			flagEnd := loc[2] + 1 // flag 部分（含最后一个非空白字符）
+			pad := strings.Repeat(" ", loc[3]-flagEnd)
+			fmt.Fprintf(out, "%s%s%s\n", cyan.Render(ln[:flagEnd]), pad, muted.Render(strings.TrimSpace(ln[loc[3]:])))
+			continue
+		}
+		fmt.Fprintln(out, muted.Render(ln))
+	}
+	fmt.Fprintln(out)
 }
 
 func initCmd() *cobra.Command {
@@ -137,10 +232,10 @@ func fastStart(cmd *cobra.Command) error {
 	}
 
 	lst, err := listener.New(listener.Options{
-		HTTPPort:    cfg.Listen.HTTP,
-		SOCKS5Port:  cfg.Listen.SOCKS5,
-		TProxyPort:  cfg.Listen.TProxy,
-		Router:      rtr,
+		HTTPPort:   cfg.Listen.HTTP,
+		SOCKS5Port: cfg.Listen.SOCKS5,
+		TProxyPort: cfg.Listen.TProxy,
+		Router:     rtr,
 	})
 	if err != nil {
 		return err
@@ -492,6 +587,12 @@ func Execute() {
 		os.Setenv("AGENT_NETX_VERSION", Version)
 	}
 	checkUpdate()
+	// 彩色帮助/用法（对所有子命令生效，沿父链继承）。
+	rootCmd.SetHelpFunc(styledHelp)
+	rootCmd.SetUsageFunc(func(cmd *cobra.Command) error {
+		styledHelp(cmd, nil)
+		return nil
+	})
 	rootCmd.AddCommand(initCmd())
 	rootCmd.AddCommand(startCmd())
 	rootCmd.AddCommand(statusCmd())
@@ -526,7 +627,9 @@ func Execute() {
 }
 
 func mustPort(p string) int {
-	if p == "" { return 0 }
+	if p == "" {
+		return 0
+	}
 	n, _ := strconv.Atoi(p)
 	return n
 }

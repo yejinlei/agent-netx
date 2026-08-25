@@ -58,34 +58,41 @@ func init() {
 }
 
 func initStyles() {
-	cy := lipgloss.Color("39")
-	gr := lipgloss.Color("46")
-	ye := lipgloss.Color("226")
-	mg := lipgloss.Color("213")
-	rd := lipgloss.Color("196")
-	wh := lipgloss.Color("252")
-	dm := lipgloss.Color("245")
+	// Claude CLI 风格结构 + 鲜活配色：
+	// 金色标题、亮紫 ❯、品红 Thinking、青色工具名、深紫状态条。
+	accent := lipgloss.Color("177") // 亮紫（✻ / ❯）
+	spark := lipgloss.Color("207")  // 品红（Thinking 动画）
+	cyan := lipgloss.Color("45")    // 青（工具名 / 元信息点缀）
+	amber := lipgloss.Color("220")  // 金（标题）
+	white := lipgloss.Color("255")  // 亮白正文
+	muted := lipgloss.Color("250")  // 亮灰次级
+	dimmer := lipgloss.Color("245") // 参数弱灰
+	lilac := lipgloss.Color("189")  // 淡紫（提示小字）
+	softrd := lipgloss.Color("203") // 柔和红（错误）
+	barBg := lipgloss.Color("53")   // 深紫底（状态条）
 
-	sHeaderBar = lipgloss.NewStyle().Foreground(cy).Bold(true)
-	sTitle = lipgloss.NewStyle().Foreground(ye).Bold(true)
-	sSubtitle = lipgloss.NewStyle().Foreground(gr)
+	sHeaderBar = lipgloss.NewStyle().Foreground(white)
+	sTitle = lipgloss.NewStyle().Foreground(amber).Bold(true)
+	sSubtitle = lipgloss.NewStyle().Foreground(lilac)
+	sVersion = lipgloss.NewStyle().Foreground(muted)
 	sStatusBar = lipgloss.NewStyle().
-		Foreground(dm).
-		Background(cy).
+		Foreground(white).
+		Background(barBg).
 		Padding(0, 1)
-	sStatusKey = lipgloss.NewStyle().Foreground(cy).Bold(true)
-	sStatusVal = lipgloss.NewStyle().Foreground(wh)
-	sUserRail = lipgloss.NewStyle().Foreground(gr).Bold(true).Width(4)
-	sAiRail = lipgloss.NewStyle().Foreground(cy).Bold(true).Width(4)
-	sUserText = lipgloss.NewStyle().Foreground(wh)
-	sAiText = lipgloss.NewStyle().Foreground(wh)
-	sToolIcon = lipgloss.NewStyle().Foreground(ye).Bold(true)
-	sToolName = lipgloss.NewStyle().Foreground(cy).Bold(true)
-	sToolArgs = lipgloss.NewStyle().Foreground(dm)
-	sToolResult = lipgloss.NewStyle().Foreground(dm)
-	sPrompt = lipgloss.NewStyle().Foreground(gr).Bold(true)
-	sThinking = lipgloss.NewStyle().Foreground(mg)
-	sError = lipgloss.NewStyle().Foreground(rd)
+	sStatusKey = lipgloss.NewStyle().Foreground(accent).Bold(true)
+	sStatusVal = lipgloss.NewStyle().Foreground(white)
+	sUserRail = lipgloss.NewStyle().Foreground(accent).Bold(true)
+	sAiRail = lipgloss.NewStyle().Width(0)
+	sUserText = lipgloss.NewStyle().Foreground(white)
+	sAiText = lipgloss.NewStyle().Foreground(white)
+	sToolIcon = lipgloss.NewStyle().Foreground(muted)
+	sToolName = lipgloss.NewStyle().Foreground(cyan).Bold(true)
+	sToolArgs = lipgloss.NewStyle().Foreground(dimmer)
+	sToolResult = lipgloss.NewStyle().Foreground(muted)
+	sPrompt = lipgloss.NewStyle().Foreground(accent).Bold(true)
+	sThinking = lipgloss.NewStyle().Foreground(spark)
+	sError = lipgloss.NewStyle().Foreground(softrd)
+	sUpdate = lipgloss.NewStyle().Foreground(amber)
 }
 
 type tui struct {
@@ -105,6 +112,9 @@ type tui struct {
 	pendingAnswer    string
 	interruptedInput string
 	inputBuf         []byte
+	modeIdx          int
+	modeFlash        time.Time
+	hideTasks        bool
 }
 
 func newTUI(ctx context.Context, cfg Config) *tui {
@@ -211,9 +221,7 @@ func (t *tui) dispatchCLIShortcut(line string) bool {
 			// No args — show a short hint
 			if arg == "" {
 				fmt.Println()
-				fmt.Println(sSubtitle.Render("  ── CLI 快捷命令 ──"))
-				fmt.Println()
-				fmt.Println("  " + sStatusKey.Render(sub.name) + "  " + sub.usage)
+				fmt.Println(sThinking.Render("✻ ") + sSubtitle.Render(sub.usage))
 				fmt.Println("  " + sSubtitle.Render("提示: 直接运行 (如 ") + sStatusVal.Render(sub.name+" start") + sSubtitle.Render(") 或传入完整参数"))
 				fmt.Println()
 				return true
@@ -258,7 +266,7 @@ func (t *tui) runCli(sub, args string, noCfg bool) {
 
 func (t *tui) showAllCommands() {
 	fmt.Println()
-	fmt.Println(sSubtitle.Render("  ── 会话命令 ──"))
+	fmt.Println(sThinking.Render("✻ ") + sSubtitle.Render("会话命令"))
 	fmt.Println()
 	fmt.Println("  " + sStatusKey.Render("/sessions") + "        列出所有已保存的会话")
 	fmt.Println("  " + sStatusKey.Render("/session <name/id>") + "  加载某个会话续写")
@@ -266,8 +274,9 @@ func (t *tui) showAllCommands() {
 	fmt.Println("  " + sStatusKey.Render("/rename <name>") + "    重命名当前会话")
 	fmt.Println("  " + sStatusKey.Render("/delete <name/id>") + "  删除某个会话")
 	fmt.Println("  " + sStatusKey.Render("/clear") + "           清空当前会话(保留元数据)")
+	fmt.Println("  " + sStatusKey.Render("Tab / Shift+Tab") + "  切换 AI 模式 (auto / manual / plan / edit)")
 	fmt.Println()
-	fmt.Println(sSubtitle.Render("  ── CLI 快捷命令 (映射到 agent-netx 子命令) ──"))
+	fmt.Println(sThinking.Render("✻ ") + sSubtitle.Render("CLI 快捷命令 (映射到 agent-netx 子命令)"))
 	fmt.Println()
 	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/init"), "生成示例配置到当前目录")
 	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/status"), "显示当前配置")
@@ -295,7 +304,7 @@ func (t *tui) showAllCommands() {
 	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/stop"), "停止子服务 (/stop <name>|all)")
 	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/restart"), "重启子服务 (/restart <name>|all)")
 	fmt.Println()
-	fmt.Println(sSubtitle.Render("  ── 会话扩展命令 (Agent 工具直连) ──"))
+	fmt.Println(sThinking.Render("✻ ") + sSubtitle.Render("会话扩展命令 (Agent 工具直连)"))
 	fmt.Println()
 	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/add-proxy"), "动态添加代理: /add-proxy <name> <type> <server> <port> [key=val ...]")
 	fmt.Printf("  %-14s  %s\n", sStatusKey.Render("/add-rule"), "动态添加规则: /add-rule <TYPE,PATTERN,TARGET>")
@@ -434,12 +443,12 @@ func (t *tui) sessionsList() {
 	all, err := t.store.List()
 	if err != nil || len(all) == 0 {
 		fmt.Println()
-		fmt.Println(sSubtitle.Render("  (暂无会话)"))
+		fmt.Println(sSubtitle.Render("✻ (暂无会话)"))
 		fmt.Println()
 		return
 	}
 	fmt.Println()
-	fmt.Println(sSubtitle.Render("  ── 会话列表 (按修改时间降序) ──"))
+	fmt.Println(sThinking.Render("✻ ") + sSubtitle.Render("会话列表 (按修改时间降序)"))
 	fmt.Printf("  %s  %s  %s  %s  %s\n",
 		sStatusKey.Render("ID"),
 		sStatusKey.Render("名称"),
@@ -470,11 +479,15 @@ func (t *tui) run(ctx context.Context) error {
 	enableVT()
 	flushStdout()
 	fmt.Printf("\033[2J\033[1;1H")
-	fmt.Printf("\033[3;%dr", termHeight-2)
+	fmt.Printf("\033[3;%dr", termHeight-4)
 	flushStdout()
 	t.renderHeader()
 	flushStdout()
+	t.renderLogo()
+	flushStdout()
 	t.renderUpdateBanner(ctx)
+	t.renderStatusBar()
+	flushStdout()
 
 	rawMode := term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd()))
 	if rawMode {
@@ -505,9 +518,13 @@ func (t *tui) run(ctx context.Context) error {
 		default:
 		}
 
+		if t.checkResize() {
+			t.relayout()
+		}
+
 		// Pending answer from ask_human HIL: consume it BEFORE readLine so the
-		// user isn't shown a blank "你 >" prompt and doesn't have to press
-		// Enter again. This renders the answer once under "你 >" and continues
+		// user isn't shown a blank "❯" prompt and doesn't have to press
+		// Enter again. This renders the answer once under "❯" and continues
 		// the main loop so tool result + LLM follow-up flow naturally.
 		line := ""
 		var err error
@@ -549,6 +566,7 @@ func (t *tui) run(ctx context.Context) error {
 		t.histIdx = len(t.history)
 		t.turns++
 		t.msgs = append(t.msgs, Message{Role: RoleUser, Content: line})
+		t.renderPrompt("")
 		t.renderUserLine(line)
 
 		// think + tool loop: run until the LLM returns zero tool calls, then
@@ -559,10 +577,10 @@ func (t *tui) run(ctx context.Context) error {
 		for {
 			assistant, err := t.thinkLoop(ctx, rawMode)
 			if err != nil {
-				fmt.Printf("\033[%d;1H", termHeight-2)
+				fmt.Printf("\033[%d;1H", termHeight-4)
 				flushStdout()
 				fmt.Println(t.renderError("⚠ " + err.Error()))
-				fmt.Printf("\033[%d;1H", termHeight-1)
+				fmt.Printf("\033[%d;1H", termHeight-2)
 				flushStdout()
 				t.msgs = t.msgs[:len(t.msgs)-1]
 				break
@@ -570,10 +588,10 @@ func (t *tui) run(ctx context.Context) error {
 			t.msgs = append(t.msgs, assistant)
 			if len(assistant.ToolCalls) == 0 {
 				if assistant.Content != "" {
-					fmt.Printf("\033[%d;1H", termHeight-2)
+					fmt.Printf("\033[%d;1H", termHeight-4)
 					flushStdout()
 					t.renderAILine(assistant.Content)
-					fmt.Printf("\033[%d;1H", termHeight-1)
+					fmt.Printf("\033[%d;1H", termHeight-2)
 					flushStdout()
 				}
 				break
@@ -582,13 +600,43 @@ func (t *tui) run(ctx context.Context) error {
 				t.tools++
 				args := ParseToolCallArgs(tc.Function.Arguments)
 				argsStr := compactArgs(args)
-				fmt.Printf("\033[%d;1H", termHeight-2)
-				flushStdout()
-				fmt.Println("  " + t.renderToolCall(tc.Function.Name, argsStr))
-				fmt.Printf("\033[%d;1H", termHeight-1)
-				flushStdout()
+				mode := t.currentMode()
+
+				// 计划模式：只展示工具计划，不实际执行。
+				if mode == modePlan {
+					if !t.hideTasks {
+						fmt.Printf("\033[%d;1H", termHeight-4)
+						flushStdout()
+						fmt.Println("  " + sToolResult.Render("↦ ") + t.renderToolCall(tc.Function.Name, argsStr))
+						msg := fmt.Sprintf("(计划模式：工具 %s 未执行，仅供预览)", tc.Function.Name)
+						t.renderToolResult(msg)
+						flushStdout()
+					}
+					msg := fmt.Sprintf("(计划模式：工具 %s 未执行，仅供预览)", tc.Function.Name)
+					t.msgs = append(t.msgs, Message{Role: RoleTool, Content: msg, ToolCallID: tc.ID})
+					continue
+				}
+
+				// 手动模式：全部工具需确认；编辑模式：仅执行类工具需确认。
+				needConfirm := mode == modeManual || (mode == modeEdit && isExecTool(tc.Function.Name))
+				if needConfirm && !t.confirmTool(tc.Function.Name, argsStr) {
+					if !t.hideTasks {
+						msg := fmt.Sprintf("(用户未批准执行工具 %s)", tc.Function.Name)
+						t.renderToolResult(msg)
+						flushStdout()
+					}
+					msg := fmt.Sprintf("(用户未批准执行工具 %s)", tc.Function.Name)
+					t.msgs = append(t.msgs, Message{Role: RoleTool, Content: msg, ToolCallID: tc.ID})
+					continue
+				}
+
+				if !t.hideTasks {
+					fmt.Printf("\033[%d;1H", termHeight-4)
+					flushStdout()
+					fmt.Println("  " + t.renderToolCall(tc.Function.Name, argsStr))
+				}
 				result := t.registry.Call(ctx, tc.Function.Name, args)
-				if result != "" {
+				if !t.hideTasks && result != "" {
 					t.renderToolResult(result)
 					flushStdout()
 				}
@@ -598,22 +646,161 @@ func (t *tui) run(ctx context.Context) error {
 					ToolCallID: tc.ID,
 				})
 			}
+
+			if t.hideTasks && t.tools > 0 {
+				names := []string{}
+
+				for _, tc := range assistant.ToolCalls {
+					names = append(names, tc.Function.Name)
+				}
+				fmt.Printf("\033[%d;1H", termHeight-4)
+				flushStdout()
+				fmt.Println(sToolResult.Render("● tasks hidden · " + strings.Join(names, " · ")))
+			}
 		}
 		t.saveCurrentSession()
 		t.renderPrompt("")
 		t.renderStatusBar()
 	}
-	panic("unreachable")
+}
+
+// aiMode 是输入行的AI模式标签(模仿 Claude Code)，Tab/Shift+Tab 循环切换。
+// 模式决定工具执行策略：
+//
+//	manual —— 每个工具调用前都要用户确认
+//	plan   —— 只展示工具计划，不执行
+//	edit   —— 配置/文件类工具直接执行，启动服务/改系统/执行命令类工具需确认
+//	auto   —— 全部工具自动执行(默认)
+type aiMode int
+
+const (
+	modeManual aiMode = iota
+	modePlan
+	modeEdit
+	modeAuto
+)
+
+var aiModeLabels = [...]string{"manual", "plan", "edit", "auto"}
+
+func (t *tui) currentMode() aiMode { return aiMode(t.modeIdx % len(aiModeLabels)) }
+
+// cycleMode 按 dir 切换 AI 模式，切换后状态条短暂高亮。
+func (t *tui) cycleMode(dir int) {
+	n := len(aiModeLabels)
+	t.modeIdx = (t.modeIdx + dir + n) % n
+	t.modeFlash = time.Now().Add(2 * time.Second)
+	t.renderStatusBar()
+	flushStdout()
+}
+
+// promptStr 是输入行的样式前缀：当前模式标签 + ❯。
+func (t *tui) promptStr() string {
+	return sPrompt.Render("> ")
+}
+
+// isExecTool 报告工具是否属于"执行类"，编辑模式下调用前需用户确认。
+func isExecTool(name string) bool {
+	switch name {
+	case "service", "sysproxy", "run_local", "run_remote", "file_copy":
+		return true
+	}
+	return false
+}
+
+// confirmTool 请求用户批准一次工具调用(手动/编辑模式)。
+func (t *tui) confirmTool(name, args string) bool {
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return true // 非交互(管道)环境自动放行
+	}
+	// 确认提示锚定到滚动区最后一行(输入框上方)，避免从任意光标位置打印造成错位。
+	fmt.Printf("\033[%d;1H", termHeight-4)
+	flushStdout()
+	fmt.Print(sThinking.Render("✻ ") + fmt.Sprintf("允许执行 [%s] %s？(Enter=执行 / n=跳过) ", name, args))
+	buf := make([]byte, 0, 8)
+	for {
+		r, err := readUtf8Rune(os.Stdin)
+		if err != nil {
+			return true
+		}
+		ch := r[0]
+		switch {
+		case ch == 13 || ch == 10:
+			t.renderStatusBar()
+			if len(buf) == 0 {
+				return true
+			}
+			return buf[0] != 110 && buf[0] != 78
+		case ch == 4 || ch == 3: // Ctrl-D / Ctrl-C
+			t.renderStatusBar()
+			return false
+		case ch == 127 || ch == 8: // backspace
+			if len(buf) > 0 {
+				buf = buf[:len(buf)-1]
+				fmt.Print("\b ")
+			}
+		default:
+			if ch >= 32 {
+				buf = append(buf, ch)
+				fmt.Print(string(r))
+			}
+		}
+	}
 }
 
 func (t *tui) renderHeader() {
-	ver := cmdVersion()
-	title := sTitle.Render("agent-netx") + " " + sVersion.Render(ver) +
-		"    " + sSubtitle.Render("按 /help 查看命令")
-	meta := sStatusKey.Render("model:") + " " + sStatusVal.Render(t.cfg.Model) +
-		"   ·   " + sStatusKey.Render("base:") + " " + sStatusVal.Render(shortBaseURL(t.cfg.BaseURL))
-	fmt.Printf("\033[1;1H\033[2K%s", title)
-	fmt.Printf("\033[2;1H\033[2K%s", meta)
+	// Claude CLI 风格：单行 ✻ 标题 + model/base 元信息，用 · 连接。
+	line := sThinking.Render("✻") + " " + sTitle.Render("agent-netx") + " " + sVersion.Render(cmdVersion())
+	if t.cfg.Model != "" {
+		line += sSubtitle.Render("  ·  model: ") + sStatusVal.Render(t.cfg.Model)
+	}
+	if t.cfg.BaseURL != "" {
+		line += sSubtitle.Render("  ·  base: ") + sStatusVal.Render(shortBaseURL(t.cfg.BaseURL))
+	}
+	fmt.Printf("\033[1;1H\033[2K%s", truncateDisp(line, termWidth-1))
+	fmt.Printf("\033[2;1H\033[2K")
+}
+
+// asciiLogoGlyphs is the 5x5 dot-matrix glyph set for the AGENT-NETX block logo.
+var asciiLogoGlyphs = map[rune][5]string{
+	'A': {"  █  ", " █ █ ", "█████", "█   █", "█   █"},
+	'G': {" ███ ", "█    ", "█ ███", "█   █", " ███ "},
+	'E': {"█████", "█    ", "████ ", "█    ", "█████"},
+	'N': {"█   █", "██  █", "█ █ █", "█  ██", "█   █"},
+	'T': {"█████", "  █  ", "  █  ", "  █  ", "  █  "},
+	'-': {"     ", "     ", "█████", "     ", "     "},
+	'X': {"█   █", "█   █", "  █  ", "█   █", "█   █"},
+}
+
+// renderLogo prints the AGENT-NETX block logo into the scroll region when the
+// TUI starts. Each line carries a fiery→cool gradient (紫→品红→金→青→蓝);
+// once the conversation starts scrolling it rolls away like Claude's intro.
+func (t *tui) renderLogo() {
+	if !term.IsTerminal(int(os.Stdout.Fd())) {
+		return
+	}
+	colors := []lipgloss.Color{"177", "207", "220", "45", "39"}
+	lines := [5]string{}
+	for _, r := range "AGENT-NETX" {
+		g, ok := asciiLogoGlyphs[r]
+		if !ok {
+			g = asciiLogoGlyphs['-']
+		}
+		for i := 0; i < 5; i++ {
+			lines[i] += g[i] + " "
+		}
+	}
+	fmt.Printf("\033[3;1H")
+	if termWidth < 66 {
+		fmt.Println(sUpdate.Render("✻ agent-netx") + "  " + sSubtitle.Render("一体化网络代理/转发/隧道工具 · 输入 /help 查看命令"))
+		fmt.Println()
+		return
+	}
+	fmt.Printf("\033[3;1H")
+	for i := 0; i < 5; i++ {
+		fmt.Printf("%s\r\n", lipgloss.NewStyle().Foreground(colors[i]).Bold(true).Render(lines[i]))
+	}
+	fmt.Printf("%s\r\n", sSubtitle.Render("✻ 一体化网络代理/转发/隧道工具 · 输入 /help 查看命令"))
+	fmt.Println()
 }
 
 func (t *tui) renderUpdateBanner(ctx context.Context) {
@@ -626,16 +813,16 @@ func (t *tui) renderUpdateBanner(ctx context.Context) {
 		return
 	}
 	if latest == cur {
-		fmt.Println(sSubtitle.Render("  ✦ You're on the latest version"))
+		fmt.Println(sSubtitle.Render("✻ You're on the latest version"))
 		fmt.Println()
 		return
 	}
 	if latestReleaseNewer(cur, latest) {
 		installURL := "https://github.com/yejinlei/agent-netx/releases/latest/download"
-		fmt.Println(sUpdate.Render(fmt.Sprintf("  A newer version of agent-netx is available (%s -> %s)", cur, latest)))
-		fmt.Println(sSubtitle.Render("    Update manually:"))
-		fmt.Printf("      \x1b[1mPowerShell:\x1b[0m  irm %s/install.ps1 | iex\n", installURL)
-		fmt.Printf("      \x1b[1mBash:\x1b[0m        curl -fsSL %s/install.sh | sh\n", installURL)
+		fmt.Println(sUpdate.Render(fmt.Sprintf("✻ A newer version of agent-netx is available (%s -> %s)", cur, latest)))
+		fmt.Println(sSubtitle.Render("  Update manually:"))
+		fmt.Printf("    \x1b[1mPowerShell:\x1b[0m  irm %s/install.ps1 | iex\n", installURL)
+		fmt.Printf("    \x1b[1mBash:\x1b[0m        curl -fsSL %s/install.sh | sh\n", installURL)
 		fmt.Println()
 	}
 }
@@ -693,88 +880,171 @@ func latestReleaseNewer(cur, latest string) bool {
 	return false
 }
 
+// checkResize 检测可见窗口尺寸变化并更新全局布局尺寸。
+func (t *tui) checkResize() bool {
+	w, h := getVisibleTerminalSize()
+	if w == termWidth && h == termHeight {
+		return false
+	}
+	termWidth, termHeight = w, h
+	return true
+}
+
+// relayout 窗口尺寸变化后重排：重置滚动区并重画 header/状态栏/输入行。
+func (t *tui) relayout() {
+	enableVT()
+	fmt.Printf("\033[2J")
+	fmt.Printf("\033[3;%dr", termHeight-4)
+	flushStdout()
+	t.renderHeader()
+	flushStdout()
+	t.renderStatusBar()
+	flushStdout()
+	t.renderPrompt(string(t.inputBuf))
+	flushStdout()
+}
+
+// renderDividers 绘制输入框上方的固定分隔线（H-3），并清空 H-1 行。
+// repaintFixed 强制重绘固定层：header/分割线/输入/状态栏；不动队列历史、不清屏。
+func (t *tui) repaintFixed() {
+	t.renderHeader()
+	flushStdout()
+	t.renderStatusBar() // 内部已包含 renderDividers（分割线）
+	flushStdout()
+	t.redrawInputBox()
+	flushStdout()
+}
+
+func (t *tui) renderDividers() {
+	// 只保留输入框上方一条分割线（Claude CLI 风格）；输入框下边界由状态栏
+	// 背景色自然区分，不再画第二条线，避免底部分割线过多。
+	//
+	// 分割线必须用 ASCII '-'：任何终端下都是精确 1 格宽，termWidth-1 个
+	// 恰好占满一行。原先的 ─ (U+2500) 是歧义宽度字符，中文终端渲染为 2 格，
+	// 整行溢出换行触发整屏上滚；而 \033[?7l (DECAWM) 旧版 conhost 不支持，
+	// 兜不住——这就是每按一键都多出一条分割线的根因。现在从源头保证不超宽。
+	bar := strings.Repeat("-", termWidth-1)
+	fmt.Printf("\033[%d;1H\033[2K%s", termHeight-3, sToolResult.Render(bar))
+	// H-1 只清空不画线：既能抹掉输入残留，又不会多出一条分割线。
+	fmt.Printf("\033[%d;1H\033[2K", termHeight-1)
+	flushStdout()
+}
 func (t *tui) renderStatusBar() {
 	if !term.IsTerminal(int(os.Stdout.Fd())) {
 		return
 	}
+	t.renderDividers()
 	// Reserved status line: dynamic info only. The model/base info is shown
 	// once in the header at TUI entry so it does not flash between user and
 	// assistant turns.
+	label := aiModeLabels[t.modeIdx%len(aiModeLabels)] + " mode"
+	labelStyle := sStatusKey
+	if time.Now().Before(t.modeFlash) {
+		labelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Background(lipgloss.Color("53")).Bold(true)
+	}
+	icon := "⏵⏵"
+	if t.currentMode() != modeAuto {
+		icon = "⏸"
+	}
+	head := sThinking.Render(icon+" ") + labelStyle.Render(label) + sStatusVal.Render(" on (shift+tab to cycle)")
+	head += sStatusVal.Render(" · esc to interrupt")
+	taskWord := "hide"
+	if t.hideTasks {
+		taskWord = "show"
+	}
+	head += sStatusVal.Render(" · ctrl+t to "+taskWord) + sStatusVal.Render(" tasks")
+	head += sStatusVal.Render(" · ← 1 agent")
 	parts := []string{}
 	if t.mem.HasSSHHosts() {
 		hosts := strings.Join(t.mem.sshAliases(), ",")
 		if len(hosts) > 30 {
 			hosts = hosts[:28] + "…"
 		}
-		parts = append(parts, sStatusKey.Render("ssh")+":"+sStatusVal.Render(hosts))
+		parts = append(parts, sStatusVal.Render(hosts))
 	}
 	if t.turns > 0 {
-		parts = append(parts, sStatusKey.Render("turns")+":"+sStatusVal.Render(fmt.Sprintf("%d", t.turns)))
+		parts = append(parts, fmt.Sprintf("%d turns", t.turns))
 	}
-	statusText := strings.Join(parts, "   ·   ")
+	tailText := strings.Join(parts, "  ·  ")
+	statusText := head
+	if tailText != "" {
+		statusText += "  ·  " + tailText
+	}
 	if statusText == "" {
-		statusText = sSubtitle.Render("agent-netx · 按 /help 查看命令")
+		statusText = "agent-netx · 输入 /help 查看命令"
 	}
-	bar := sStatusBar.Render(" " + statusText + " ")
-	for lipgloss.Width(bar) < termWidth {
-		bar += " "
+	// ⏸ ← · ✻ 等歧义宽度字符在中文终端渲染为 2 格，lipgloss.Width() 按 1 格
+	// 计算会低估实际宽度；状态栏位于屏幕最后一行，一旦超宽就触发整屏上滚，
+	// 每次按键重绘都残留一条旧分割线。旧版 conhost 不支持 \033[?7l，无法靠
+	// 转义兜底，因此这里按最坏宽度截断 + 手工补空格，保证写入绝不超过
+	// termWidth 格、绝不滚动（西方终端下最多少补几格背景，属正常视觉余量）。
+	content := truncateDisp(statusText, termWidth-2)
+	if pad := termWidth - 2 - printableLen(content); pad > 0 {
+		content += strings.Repeat(" ", pad)
 	}
-	fmt.Printf("\033[%d;1H", termHeight-1)
-	fmt.Print(bar)
+	bar := sStatusBar.Render(content)
+	fmt.Printf("\033[%d;1H\033[2K%s", termHeight, bar)
 	flushStdout()
 }
 
 func (t *tui) renderUserLine(line string) {
-	fmt.Println()
-	fmt.Println(sPrompt.Render("你 > ") + sUserText.Render(line))
+	fmt.Printf("\033[%d;1H", termHeight-4)
+	flushStdout()
+	fmt.Printf("%s\r\n", sPrompt.Render("❯ ")+sUserText.Render(line))
 }
 
 func (t *tui) renderAILine(content string) {
-	lines := wrapLines(content, termWidth-12)
-	for i, l := range lines {
-		if i == 0 {
-			fmt.Println(sAiRail.Render("AI  ") + sAiText.Render(l))
-		} else {
-			fmt.Println(sAiRail.Render("    ") + sAiText.Render(l))
-		}
+	lines := wrapLines(content, termWidth-4)
+	for _, l := range lines {
+		fmt.Printf("%s\r\n", sAiText.Render(l))
 	}
 	fmt.Println()
 }
 
+// compactTail 按显示宽度截断参数摘要，超宽加 … 避免工具卡片折行错位。
+func compactTail(st string, max int) string {
+	if printableLen(st) <= max {
+		return st
+	}
+	var sb strings.Builder
+	width := 0
+	for _, r := range st {
+		w := 1
+		if r >= 0x1100 && r <= 0x115F || r >= 0x2E80 && r <= 0x9FFF || r >= 0xA000 && r <= 0xA4CF || r >= 0xAC00 && r <= 0xD7A3 || r >= 0xF900 && r <= 0xFAFF || r >= 0xFE30 && r <= 0xFE6F {
+			w = 2
+		}
+		if width+w > max-1 {
+			break
+		}
+		width += w
+		sb.WriteRune(r)
+	}
+	return sb.String() + "…"
+}
 func (t *tui) renderToolCall(name, args string) string {
 	if args == "" {
-		return sToolIcon.Render("⚙ ") + sToolName.Render(name)
+		return sToolIcon.Render("● ") + sToolName.Render(name)
 	}
-	return sToolIcon.Render("⚙ ") + sToolName.Render(name) + sToolArgs.Render("("+args+")")
+	args = compactTail(args, 60)
+	return sToolIcon.Render("● ") + sToolName.Render(name) + sToolIcon.Render("(") + sToolArgs.Render(args) + sToolIcon.Render(")")
 }
 func (t *tui) renderToolResult(result string) {
+	out := result
+	if len(out) > 400 {
+		out = out[:400] + "\n…(截断)"
+	}
+	indent := "⎿  "
 	if !term.IsTerminal(int(os.Stdout.Fd())) {
-		out := result
-		if len(out) > 400 {
-			out = out[:400] + "\n…(截断)"
-		}
-		for i, l := range strings.Split(out, "\n") {
-			prefix := "     └─"
-			if i > 0 {
-				prefix = "     │ "
-			}
-			fmt.Println(sToolResult.Render(prefix + " " + l))
+		for _, l := range strings.Split(out, "\n") {
+			fmt.Println(sToolResult.Render(indent + l))
 		}
 		return
 	}
-	preview := result
-	if len(preview) > 400 {
-		preview = preview[:400] + "\n…(截断)"
-	}
-	scrollBottom := termHeight - 2
-	promptRow    := termHeight
+	scrollBottom := termHeight - 4
+	promptRow := termHeight - 2
 	fmt.Printf("\033[%d;1H", scrollBottom)
-	for i, l := range strings.Split(preview, "\n") {
-		prefix := "     └─"
-		if i > 0 {
-			prefix = "     │ "
-		}
-		fmt.Println(sToolResult.Render(prefix + " " + l))
+	for _, l := range strings.Split(out, "\n") {
+		fmt.Printf("%s\r\n", sToolResult.Render(indent+l))
 	}
 	fmt.Printf("\033[%d;1H", promptRow)
 }
@@ -789,13 +1059,6 @@ func (t *tui) inputHeight() int {
 	return count
 }
 
-func inputPrefix(n int) string {
-	if n == 1 {
-		return "  你 > "
-	}
-	return "  │   "
-}
-
 func (t *tui) redrawInputBox() {
 	txt := string(t.inputBuf)
 	lines := strings.Split(txt, "\n")
@@ -803,7 +1066,7 @@ func (t *tui) redrawInputBox() {
 	if wrap < 1 {
 		wrap = 1
 	}
-	bottom := termHeight
+	bottom := termHeight - 2
 	top := bottom - wrap + 1
 	const bodyTop = 3
 	if top < bodyTop {
@@ -815,14 +1078,23 @@ func (t *tui) redrawInputBox() {
 	for i, line := range lines {
 		row := bottom - (wrap - 1 - i)
 		fmt.Printf("\033[%d;1H\033[2K", row)
-		fmt.Print(sPrompt.Render(inputPrefix(wrap-i)) + line)
+		if i == 0 {
+			// 中文输入每字 2 格，超长输入若直接打印会溢出换行到状态栏区域，
+			// 按最坏宽度截断到一行内（光标隐藏，无对齐问题）。
+			fmt.Print(truncateDisp(t.promptStr()+line, termWidth-2))
+		} else {
+			fmt.Print(truncateDisp("  "+line, termWidth-2))
+		}
 	}
 	fmt.Printf("\033[%d;1H", bottom)
+	// renderStatusBar 内部会重画输入框上方的分割线、清空 H-1 并把状态栏
+	// 刷到最底行，一次调用即可，不再手动重复画线。
+	t.renderStatusBar()
 	flushStdout()
 }
 
 func (t *tui) renderError(s string) string {
-	return "  AI " + sError.Render(s)
+	return sError.Render("✻ " + s)
 }
 
 func (t *tui) renderPrompt(line string) {
@@ -832,9 +1104,8 @@ func (t *tui) renderPrompt(line string) {
 
 func (t *tui) renderGoodbye() {
 	fmt.Println()
-	fmt.Println(sSubtitle.Render("  ── 再见 👋  ") +
-		sStatusVal.Render(fmt.Sprintf("%d 轮对话 · %d 次工具调用", t.turns, t.tools)) +
-		sSubtitle.Render(" ──"))
+	fmt.Println(sThinking.Render("✻ ") + sSubtitle.Render("会话已结束  ") +
+		sStatusVal.Render(fmt.Sprintf("%d turns · %d tool calls", t.turns, t.tools)))
 }
 
 func (t *tui) readLine(rawMode bool) (string, error) {
@@ -873,12 +1144,23 @@ loop:
 		}
 		switch runeBytes[0] {
 		case 9: // TAB
-			t.completeTab(&t.inputBuf)
+			if len(t.inputBuf) > 0 && t.inputBuf[0] == 47 {
+				t.completeTab(&t.inputBuf)
+			} else {
+				t.cycleMode(1)
+			}
 			t.redrawInputBox()
+			continue
+		case 20: // Ctrl+T：切换任务折叠
+			t.hideTasks = !t.hideTasks
+			t.renderStatusBar()
 			continue
 		case 13:
 			break loop
 		case 10:
+			continue
+		case 12: // Ctrl+L：重绘固定层（header/线/输入/状态），不动队列历史
+			t.repaintFixed()
 			continue
 		case 4:
 			return "", io.EOF
@@ -934,6 +1216,13 @@ loop:
 				_, sz := utf8.DecodeLastRune(t.inputBuf)
 				t.inputBuf = t.inputBuf[:len(t.inputBuf)-sz]
 				t.redrawInputBox()
+			case 'Z': // Shift+Tab：/ 命令反向补全；否则反向切换 AI 模式
+				if len(t.inputBuf) > 0 && t.inputBuf[0] == 47 {
+					t.completeTabRev(&t.inputBuf)
+				} else {
+					t.cycleMode(-1)
+				}
+				t.redrawInputBox()
 			case 'H':
 				if len(t.inputBuf) > 0 {
 					_, sz := utf8.DecodeLastRune(t.inputBuf)
@@ -974,7 +1263,11 @@ func readUtf8Rune(r io.Reader) ([]byte, error) {
 
 func readUtf8Tail(r io.Reader, prefix []byte, n int) ([]byte, error) {
 	tail := make([]byte, n)
-	if _, err := r.Read(tail); err != nil {
+	// Windows raw 模式下 Read 不保证一次返回全部 n 个尾字节：快速打字或
+	// 中文输入法提交时，一个多字节字符可能被拆到两次 Read。短读会把残缺
+	// 字节当成完整字符，之后所有字节级联错位，输入变成 "æ\uFFFD\uFFFD想" 之类
+	// 的乱码。io.ReadFull 循环读，直到凑齐为止。
+	if _, err := io.ReadFull(r, tail); err != nil {
 		return prefix, err
 	}
 	return append(prefix, tail...), nil
@@ -985,39 +1278,48 @@ func readUtf8Tail(r io.Reader, prefix []byte, n int) ([]byte, error) {
 // sends \r) — user would see nothing and never get a chance to respond.
 // tuiAsk echoes each typed char (or '*' for hidden passwords), handles Enter,
 // backspace (UTF-8 aware), and Ctrl-C/Ctrl-D, and styles the prompt so it's
-// visually distinct from the normal "你 >" input line.
+// visually distinct from the normal "❯" input line.
 func (t *tui) tuiAsk() askFunc {
 	return func(ctx context.Context, question string) string {
-		fmt.Println()
-		fmt.Print(sPrompt.Render("⚠ 请回答: ") + question)
+		// 问题块锚定到滚动区：最后一行在 H-2，多行向上展开；输入光标停在 H-2 行尾。
+		qs := strings.Split(question, "\n")
+		startRow := termHeight - 4 - (len(qs) - 1)
+		if startRow < 3 {
+			startRow = 3
+		}
+		for i, q := range qs {
+			if i == len(qs)-1 {
+				fmt.Printf("\033[%d;1H", termHeight-4)
+				flushStdout()
+				fmt.Print(sThinking.Render("✻ ") + q)
+			} else {
+				fmt.Printf("\033[%d;1H", startRow+i)
+				fmt.Printf("%s\r\n", sThinking.Render("✻ "+q))
+			}
+		}
 		buf := make([]byte, 0, 4096)
 		hidden := isPasswordPrompt(question)
 		for {
 			runeBytes, err := readUtf8Rune(os.Stdin)
 			if err != nil {
-				fmt.Println()
 				t.renderStatusBar()
 				return string(buf)
 			}
 			ch := runeBytes[0]
 			switch {
 			case ch == 13, ch == 10: // Enter
-				fmt.Println()
 				t.renderStatusBar()
-				// Set pending answer so the main loop renders the answer once
-				// under "你 > " — prevents the "user has to enter twice" bug.
 				t.pendingAnswer = string(buf)
 				return string(buf)
 			case ch == 4, ch == 3: // Ctrl-D / Ctrl-C
-				fmt.Println()
 				t.renderStatusBar()
 				return ""
 			case ch == 127, ch == 8: // backspace
 				if len(buf) > 0 {
 					_, sz := utf8.DecodeLastRune(buf)
 					buf = buf[:len(buf)-sz]
-					for i := 0; i < sz; i++ {
-						fmt.Print("\b \b")
+					for x := 0; x < sz; x++ {
+						fmt.Print("\b ")
 					}
 				}
 			default:
@@ -1031,7 +1333,6 @@ func (t *tui) tuiAsk() askFunc {
 				}
 			}
 		}
-		return string(buf)
 	}
 }
 
@@ -1045,7 +1346,7 @@ func IsInterrupted(err error) bool { return errors.Is(err, ErrInterrupted) }
 func (t *tui) thinkLoop(ctx context.Context, rawMode bool) (Message, error) {
 	didPromptDuringThink = false
 	if !rawMode {
-		fmt.Print(sThinking.Render("  AI 思考中 ..."))
+		fmt.Print(sThinking.Render("✽ Doing…"))
 		msg, err := t.llm.Complete(ctx, t.msgs)
 		fmt.Printf("\r%s\r", ClearLn)
 		return msg, err
@@ -1104,12 +1405,12 @@ func (t *tui) thinkLoop(ctx context.Context, rawMode bool) (Message, error) {
 				if b >= 32 {
 					if !promptShown {
 						// First key pressed while thinking: clear the spinner
-						// line and render a fresh "你 > " so the user can see
+						// line and render a fresh "❯ " so the user can see
 						// what they're typing.
 						promptShown = true
 						didPromptDuringThink = true
 						fmt.Printf("\r%s\n", ClearLn)
-						fmt.Print(sPrompt.Render("你 > "))
+						fmt.Print(t.promptStr())
 					}
 					buf = append(buf, b)
 					fmt.Print(string(rune(b)))
@@ -1118,18 +1419,23 @@ func (t *tui) thinkLoop(ctx context.Context, rawMode bool) (Message, error) {
 		}
 	}()
 
-	frames := []string{"⠋", "⠕", "⠙", "⠘", "⠼", "⠴", "⠆", "⠇", "⠇", "⠏"}
+	frames := []string{"✽", "✾", "✼", "✻", "✺", "✹"}
 	go func() {
 		ticker := time.NewTicker(90 * time.Millisecond)
+		started := time.Now()
 		defer ticker.Stop()
-		fmt.Print(SaveCursor + sThinking.Render("  AI 思考中 "))
+		fmt.Print(SaveCursor + sThinking.Render("✽ Doing… "))
 		i := 0
 		for {
 			select {
 			case <-cancelCtx.Done():
 				return
 			case <-ticker.C:
-				fmt.Print(sThinking.Render(frames[i%len(frames)]))
+				secs := int(time.Since(started) / time.Second)
+				fmt.Printf("\r%s%s%s",
+					sThinking.Render("✽ Doing… "),
+					sThinking.Render(fmt.Sprintf("(%ds) ", secs)),
+					sThinking.Render(frames[i%len(frames)]))
 				i++
 			}
 		}
@@ -1137,7 +1443,10 @@ func (t *tui) thinkLoop(ctx context.Context, rawMode bool) (Message, error) {
 
 	msg, err := t.llm.Complete(cancelCtx, t.msgs)
 	cancel()
-	<-done
+	select {
+	case <-done:
+	case <-time.After(150 * time.Millisecond):
+	}
 
 	// Clear the spinner line (and the echo line if the user typed anything).
 	fmt.Printf("\033[8m\r%s\r", ClearLn)
@@ -1162,7 +1471,7 @@ func (t *tui) thinkLoop(ctx context.Context, rawMode bool) (Message, error) {
 }
 
 // promptRenderedDuringThink tracks whether the stdin goroutine rendered a
-// "你 > " line while we were thinking. We need this so thinkLoop can clear
+// "❯" line while we were thinking. We need this so thinkLoop can clear
 // both the spinner line AND the echo line before returning.
 var didPromptDuringThink bool
 
@@ -1189,20 +1498,31 @@ func shortBaseURL(s string) string {
 	return u
 }
 
+// wrapLines wraps s to limit columns without adding a hanging indent, so
+// continuation lines stay left-aligned and any real leading whitespace in the
+// text (e.g. indented code blocks) is preserved.
+// wrapLines 按终端显示宽度折行：CJK(中文/日/韩) 占 2 列，其余 1 列，避免按字节折行后中文行超宽、终端二次折行导致错位。
 func wrapLines(s string, limit int) []string {
 	var out []string
 	for _, line := range strings.Split(s, "\n") {
-		for len(line) > limit {
-			chop := limit
-			idx := strings.LastIndex(line[:limit], " ")
-			if idx >= limit/2 {
-				chop = idx
+		for printableLen(line) > limit {
+			width, chop := 0, 0
+			for _, r := range line {
+				w := 1
+				if r >= 0x1100 && r <= 0x115F || r >= 0x2E80 && r <= 0x9FFF || r >= 0xA000 && r <= 0xA4CF || r >= 0xAC00 && r <= 0xD7A3 || r >= 0xF900 && r <= 0xFAFF || r >= 0xFE30 && r <= 0xFE6F {
+					w = 2
+				}
+				if width+w > limit {
+					break
+				}
+				width += w
+				chop++
+			}
+			if chop == 0 {
+				chop = 1
 			}
 			out = append(out, line[:chop])
 			line = line[chop:]
-			if len(line) > 0 {
-				line = strings.Repeat(" ", 6) + line
-			}
 		}
 		if line != "" {
 			out = append(out, line)

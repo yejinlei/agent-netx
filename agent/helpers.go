@@ -72,8 +72,12 @@ func shortUUID() string {
 }
 
 // printableLen counts the terminal display width of s, stripping ANSI escapes.
-// CJK (Han / Kana / Hangul) runes render as 2 cells wide, so we count them
-// as 2 to keep │ / padding aligned on lines that contain Chinese text.
+// CJK runes render as 2 cells; East Asian Ambiguous-width symbols (─ ● ← · ⏸ ✻ …)
+// render as 2 cells on CJK terminals but 1 on Western terminals, so they are
+// counted as 2 (worst case). Overestimating only wraps/truncates slightly
+// earlier — it never overflows the right edge, which is what triggers a
+// full-screen scroll (the root cause of divider lines stacking up on every
+// keypress in the TUI).
 func printableLen(s string) int {
 	inEsc := false
 	n := 0
@@ -88,17 +92,67 @@ func printableLen(s string) int {
 			}
 			continue
 		}
-		switch {
-		case r >= 0x1100 && r <= 0x115F,   // Hangul Jamo
-			r >= 0x2E80 && r <= 0x9FFF,    // CJK Unified + CJK Extension A + Kanji parts
-			r >= 0xA000 && r <= 0xA4CF,    // Hiragana / Katakana
-			r >= 0xAC00 && r <= 0xD7A3,    // Hangul Syllables
-			r >= 0xF900 && r <= 0xFAFF,    // CJK Compatibility Ideographs
-			r >= 0xFE30 && r <= 0xFE6F:    // CJK Compatibility Forms
-			n += 2
-		default:
-			n++
-		}
+		n += dispRuneWidth(r)
 	}
 	return n
+}
+
+// dispRuneWidth returns the worst-case number of terminal cells r occupies.
+func dispRuneWidth(r rune) int {
+	switch {
+	case r >= 0x1100 && r <= 0x115F, // Hangul Jamo
+		r >= 0x2E80 && r <= 0x9FFF,   // CJK Extension A + Unified + Kana
+		r >= 0xA000 && r <= 0xA4CF,   // Hiragana / Katakana
+		r >= 0xAC00 && r <= 0xD7A3,   // Hangul Syllables
+		r >= 0xF900 && r <= 0xFAFF,   // CJK Compatibility Ideographs
+		r >= 0xFE30 && r <= 0xFE6F,   // CJK Compatibility Forms
+		r >= 0xFF00 && r <= 0xFF60,   // Fullwidth forms
+		r >= 0x20000 && r <= 0x2FA1F: // CJK Extensions B-F
+		return 2
+	case r == 0x00B7, // · middle dot
+		r == 0x2026,                // … ellipsis
+		r >= 0x2190 && r <= 0x21FF, // arrows ← ↑ → ↓
+		r >= 0x2200 && r <= 0x22FF, // math operators
+		r >= 0x2300 && r <= 0x23FF, // misc technical: ⏵ ⏸ ⎿
+		r >= 0x2460 && r <= 0x25FF, // enclosed, box drawing ─│, geometric ●◆
+		r >= 0x2600 && r <= 0x27BF, // misc symbols / dingbats: ✻ ❯ ✔
+		r >= 0x2B00 && r <= 0x2BFF: // misc arrows / stars
+		return 2
+	}
+	return 1
+}
+
+// truncateDisp clips s to at most max display cells. ANSI escapes are kept
+// intact and not counted; if the cut lands inside styled text a reset is
+// appended so colors don't leak into following output.
+func truncateDisp(s string, max int) string {
+	inEsc := false
+	w := 0
+	cut := false
+	var sb strings.Builder
+	for _, r := range s {
+		if r == '\033' {
+			inEsc = true
+			sb.WriteRune(r)
+			continue
+		}
+		if inEsc {
+			sb.WriteRune(r)
+			if r == 'm' {
+				inEsc = false
+			}
+			continue
+		}
+		rw := dispRuneWidth(r)
+		if w+rw > max {
+			cut = true
+			break
+		}
+		w += rw
+		sb.WriteRune(r)
+	}
+	if cut {
+		sb.WriteString("\033[0m")
+	}
+	return sb.String()
 }

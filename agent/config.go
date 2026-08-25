@@ -62,30 +62,30 @@ var ModeLabel = map[AgentMode]string{
 
 // Config configures the LLM-backed agent.
 type Config struct {
-	Enable         bool       `yaml:"enable"`
-	BaseURL        string     `yaml:"base-url"`
-	APIKey         string     `yaml:"api-key"`
-	Model          string     `yaml:"model"`
-	SystemPrompt   string     `yaml:"system-prompt"`
-	Mode            AgentMode  `yaml:"-"`
-	ConfigPath      string     `yaml:"-"`
-	AgentConfigPath string     `yaml:"-"`
-	MemoryPath      string     `yaml:"-"`
-	Timeout         int        `yaml:"-"`
-	MaxRetries      int        `yaml:"-"`
-	ContinueSession string     `yaml:"-"`
+	Enable          bool      `yaml:"enable"`
+	BaseURL         string    `yaml:"base-url"`
+	APIKey          string    `yaml:"api-key"`
+	Model           string    `yaml:"model"`
+	SystemPrompt    string    `yaml:"system-prompt"`
+	Mode            AgentMode `yaml:"-"`
+	ConfigPath      string    `yaml:"-"`
+	AgentConfigPath string    `yaml:"-"`
+	MemoryPath      string    `yaml:"-"`
+	Timeout         int       `yaml:"-"`
+	MaxRetries      int       `yaml:"-"`
+	ContinueSession string    `yaml:"-"`
 }
 
 // ConfigAgent is the standalone LLM configuration read from "agent.yml".
 type ConfigAgent struct {
-	BaseURL      string    `yaml:"base-url"`
-	APIKey       string    `yaml:"api-key"`
-	Model        string    `yaml:"model"`
-	SystemPrompt string    `yaml:"system-prompt"`
-	Mode         string    `yaml:"mode"`
-	MemoryPath   string    `yaml:"memory-path"`
-	Timeout      int       `yaml:"timeout"`
-	MaxRetries   int       `yaml:"max-retries"`
+	BaseURL      string `yaml:"base-url"`
+	APIKey       string `yaml:"api-key"`
+	Model        string `yaml:"model"`
+	SystemPrompt string `yaml:"system-prompt"`
+	Mode         string `yaml:"mode"`
+	MemoryPath   string `yaml:"memory-path"`
+	Timeout      int    `yaml:"timeout"`
+	MaxRetries   int    `yaml:"max-retries"`
 }
 
 const DefaultAgentConfigPath = "agent.yml"
@@ -124,8 +124,10 @@ func DefaultSystemPrompt() string {
 3. **缺少必要信息时由人工介入(HIL)**：执行前需要某项信息（协议、远端地址、端口、密码、alias、SSH 凭据、偏好等）→ 先尝试从上下文和记忆(recall)推断；推断不出则**必须调用 ask_human** 向用户获取，拿到答案后**必须继续完成用户请求**——用已收集到的信息 + 合理默认值调用 gen_config 落地，直到方案真正生成并向用户说明，不要停在问问题这一步，不要因为 recall 返回空就放弃。
 4. 用户想从零生成一份配置时（已明确描述代理/端口/分组/规则，或通过 ask_human 拿到类型），用 gen_config：把用户描述转成 spec 对象，工具负责拼装+校验+落盘，不要自己手写 YAML。**gen_config 只需要"类型"这一个最小输入，其余参数（端口/地址/密钥等）由工具自动补合理默认值**——不要因为"缺参数"就反复问用户或反复 recall。**ask_human 拿到答案后必须继续执行**：基于已收集的信息 + 合理默认值调用 gen_config 落地，直到方案真正配置完成并向用户说明结果，**禁止**在问完问题后只调 recall 就结束本轮——用户的最终目标（VPN/代理/端口转发）必须由 gen_config 或 update_config 落地。
 5. 危险操作（start/stop 服务、覆盖远程文件、gen_config 覆盖文件）先向用户确认，或调用 ask_human。
-6. 交互模式下 ask_human 会真正弹 ⚠ 请回答: 提示等用户输入；非交互模式才会返回空/错误。不要把它当成"会失败的工具"跳过。
+6. 交互模式下 ask_human 会真正弹出 ✻ 提示等待用户输入；非交互模式才会返回空/错误。不要把它当成"会失败的工具"跳过。
 7. 能从记忆复用的事实优先 recall，避免重复问用户；新事实用 remember 存入记忆。
 8. SSH 文件传输：主机信息优先用已记住的 alias；缺信息时工具会自动向用户询问并记入记忆，无需自己追问。
-9. 回复用中文，简洁。`
+9. 回复用中文，简洁。
+10. **困难即停、征求用户意见（自动模式同样适用）**：连续失败、重试未见效、或方案受阻（网络/权限/反复出错）时，立即停下来——先向用户说明当前状况与已尝试过的方案，然后用 ask_human（交互界面可直接文本提问）征求下一步选择；**禁止无限盲目重试**继续撞墙，除非用户明确说"继续重试"或"自动处理"。
+11. **参考会话历史与记忆**：每轮开始或重试前，先回顾本会话已有消息与记忆(recall) 中的结论，**不要重复已失败或已确认的方案与事实**；若新判断与历史矛盾，要显式说明原因。`
 }

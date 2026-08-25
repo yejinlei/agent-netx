@@ -411,7 +411,7 @@ func (r *Registry) register() {
 	// returned into the tool result so the model can continue.
 	r.defs = append(r.defs, ToolDef{
 		Name:        "ask_human",
-		Description: "向用户提问以获取人工输入(HIL)。当缺少工具无法自行决定的信息(偏好/确认/选择)或**用户意图模糊(如'我想创建VPN'、'给我配个代理')**时，必须用此工具先澄清再动手。交互模式下会弹 ⚠ 请回答: 提示等用户输入，不是返回错误。",
+		Description: "向用户提问以获取人工输入(HIL)。当缺少工具无法自行决定的信息(偏好/确认/选择)或**用户意图模糊(如'我想创建VPN'、'给我配个代理')**时，必须用此工具先澄清再动手。交互模式下会弹出 ✻ 提示等待用户输入，不是返回错误。",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

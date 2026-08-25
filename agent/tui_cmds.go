@@ -8,7 +8,8 @@ import (
 
 // addProxyCmd adds a proxy to the dynamic overlay (~/.agent-netx/dynamic.yml)
 // so it takes effect at the next buildRouter load. Syntax:
-//   /add-proxy name type server port [key=value...]
+//
+//	/add-proxy name type server port [key=value...]
 func (t *tui) addProxyCmd(line string) {
 	fields := strings.Fields(strings.TrimSpace(line))
 	if len(fields) < 4 {
@@ -47,7 +48,8 @@ func (t *tui) addProxyCmd(line string) {
 }
 
 // addRuleCmd adds a routing rule to the dynamic overlay. Syntax:
-//   /add-rule TYPE,PATTERN,TARGET
+//
+//	/add-rule TYPE,PATTERN,TARGET
 func (t *tui) addRuleCmd(line string) {
 	rule := strings.TrimSpace(line)
 	if rule == "" {
@@ -59,7 +61,8 @@ func (t *tui) addRuleCmd(line string) {
 }
 
 // sessionExportCmd exports the current session to a file. Syntax:
-//   /session-export <dst>   (or /session-export <idOrName> <dst>)
+//
+//	/session-export <dst>   (or /session-export <idOrName> <dst>)
 func (t *tui) sessionExportCmd(line string) {
 	fields := strings.Fields(strings.TrimSpace(line))
 	if len(fields) < 1 {
@@ -117,10 +120,10 @@ func (t *tui) completeSlash(text string) []string {
 
 // completeTab handles a TAB keystroke in readLine. It completes the /-command
 // token in buf. Behaviour:
-//  - Exactly one match → replace the token with the full command + " ".
-//  - Multiple matches → redraw with trailing " " and re-invoking TAB cycles
-//    through candidates, starting with the first one after the prefix.
-//  - No match → silent.
+//   - Exactly one match → replace the token with the full command + " ".
+//   - Multiple matches → redraw with trailing " " and re-invoking TAB cycles
+//     through candidates, starting with the first one after the prefix.
+//   - No match → silent.
 //
 // buf must be non-nil. Only slash-prefixed input triggers completion;
 // ordinary text is a no-op.
@@ -158,13 +161,43 @@ func (t *tui) completeTab(buf *[]byte) {
 }
 
 func (t *tui) writeBuf(buf *[]byte, s string) {
-	prompt := sPrompt.Render("你 > ")
+	prompt := t.promptStr()
 	*buf = []byte(s)
 	fmt.Printf("\r%s%s%s", ClearLn, prompt, s)
 }
 
 // Reset the tab-completion cycle state when a new line is started. Called at
 // the top of readLine.
+// completeTabRev handles Shift+Tab on /-commands: cycles candidates backward.
+func (t *tui) completeTabRev(buf *[]byte) {
+	b := *buf
+	if len(b) == 0 || b[0] != '/' {
+		return
+	}
+	rest := string(b[1:])
+	spaceIdx := strings.IndexByte(rest, ' ')
+	prefix := rest
+	if spaceIdx >= 0 {
+		prefix = rest[:spaceIdx]
+	}
+	candidates := t.completeSlash(prefix)
+	if len(candidates) == 0 {
+		return
+	}
+	if len(candidates) == 1 {
+		t.writeBuf(buf, "/"+candidates[0]+" "+rest[spaceIdx+1:])
+		return
+	}
+	if prefix == "" {
+		t.tabIdx = len(candidates) - 1
+		t.writeBuf(buf, "/"+candidates[t.tabIdx]+" ")
+		return
+	}
+	idx := t.tabIdx
+	t.tabIdx = (idx - 1 + len(candidates)) % len(candidates)
+	t.writeBuf(buf, "/"+candidates[t.tabIdx]+" "+rest[spaceIdx+1:])
+}
+
 func (t *tui) resetTab() {
 	t.tabIdx = 0
 }

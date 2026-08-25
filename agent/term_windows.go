@@ -11,6 +11,9 @@ func init() {
 	enableVT()
 }
 
+// enableVT 只开 VT 序列处理，保留控制台的换行自动回车（\n -> \r\n）。
+// 注意：不能设置 DISABLE_NEWLINE_AUTO_RETURN，否则普通命令（如 -h 帮助）
+// 的每个 \n 都不回行首，输出会变成阶梯状乱码。
 func enableVT() {
 	h, err := windows.GetStdHandle(windows.STD_OUTPUT_HANDLE)
 	if err != nil || h == windows.InvalidHandle {
@@ -21,8 +24,7 @@ func enableVT() {
 		return
 	}
 	mode = mode | windows.ENABLE_PROCESSED_OUTPUT |
-		windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING |
-		windows.DISABLE_NEWLINE_AUTO_RETURN
+		windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING
 	_ = windows.SetConsoleMode(h, mode)
 }
 
