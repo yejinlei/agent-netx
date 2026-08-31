@@ -150,7 +150,8 @@ agent-netx [command]
   start        启动代理（-c 配置文件 / --proxy 快速模式）—— 一键全开所有启用项
   init         生成示例配置
   status       显示当前配置
-  ping         测试代理延迟
+  ping         hping3 风格探测：ICMP/TCP/UDP 三模式 + traceroute（无需配置）
+  socat        TCP/UDP 双向中继，socat 风格地址（无需配置）
   use          切换手动分组
   sysproxy     一键开关系统代理 (on/off/status)
   forward      SSH 风格端口转发 (-L / -R / -D / -U / tls)

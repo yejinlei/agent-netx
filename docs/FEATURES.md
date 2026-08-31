@@ -182,7 +182,8 @@ rules:
 | REST API | 同上进程 | 外部程序控制分组切换、读统计 | ✅ |
 | DNS 服务器 | `dns` | 本地 DNS，DoH/DoT/直连 + FakeDNS | ✅ |
 | 系统代理 | `sysproxy on/off/status` | 一键启停系统代理 | ✅ |
-| ping | `ping` | 测所有代理延迟 | ✅ |
+| ping | `ping <target>` | hping3 风格探测：ICMP/TCP/UDP 三模式 + traceroute，无需配置文件 | ✅ |
+| socat | `socat <addr1> <addr2>` | TCP/UDP 双向中继，socat 风格地址，无需配置文件 | ✅ |
 | status | `status` | 显示当前配置 | ✅ |
 | use | `use <分组> <代理>` | 切手动分组 | ✅ |
 | init | `init` | 生成示例 config.yml | ✅ |
