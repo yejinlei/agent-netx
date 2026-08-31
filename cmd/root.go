@@ -11,10 +11,12 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"agent-netx/agent"
 	"agent-netx/config"
 	"agent-netx/listener"
+	"agent-netx/netdiag"
 	"agent-netx/proxy"
 	"agent-netx/router"
 	"agent-netx/web"
@@ -360,100 +362,202 @@ func statusCmd() *cobra.Command {
 	return cmd
 }
 
+// pingCmd 是一个 hping3 风格的命令行探测器（ICMP/TCP/UDP），不需要配置文件。
+// 用户的硬约束："最终的ping功能不需要配置，只支持命令方式"——故彻底放弃
+// 旧的代理延迟/config 路径，改为直接调用 netdiag.Probe / Traceroute。
+//
+// 注意：根命令的持久 flag --config/-c 被所有子命令继承，因此 ping 的 count
+// 不能再用 -c 简写（pflag 合并持久 flag 时若简写冲突会 panic），count 仅提供
+// 长选项 --count（对应 hping3 -c）。其余 hping3 简写 -1/-S/-2/-i/-d/-p/-I/-V/-a
+// 均保留。
 func pingCmd() *cobra.Command {
-	var extraProxy string
+	var (
+		modeICMP     bool
+		modeTCP      bool
+		modeUDP      bool
+		count        int
+		intervalStr  string
+		dataSize     int
+		port         int
+		iface        string
+		verbose      bool
+		flood        bool
+		spoof        string
+		doTraceroute bool
+		hops         int
+		timeout      time.Duration
+	)
 	cmd := &cobra.Command{
-		Use:   "ping [URL]",
-		Short: "Test proxy latency against each configured proxy",
-		Long: `Test latency from each proxy to the given URL.
-Defaults to https://www.gstatic.com/generate_204 when no URL is provided.
+		Use:   "ping <host>",
+		Short: "Probe a host via ICMP/TCP/UDP (hping3-aligned, no config)",
+		Long: `Probe a host with ICMP/TCP/UDP — aligned with hping3, no config file (CLI only).
 
-With a config file (-c): pings every proxy in it.
-Without a config: use --proxy to test a single proxy URL.
+Mode (pick one; default ICMP):
+  -1, --icmp   ICMP echo (needs admin/root for the raw socket)
+  -S, --tcp    TCP connect probe (no privilege; full handshake, not a raw SYN)
+  -2, --udp    UDP probe (no privilege)
 
 Examples:
-  agent-netx ping https://www.baidu.com
-  agent-netx ping https://www.baidu.com --proxy ss://aes-256-gcm:pass@host:port
-  agent-netx ping --proxy http://user:pass@host:port`,
+  agent-netx ping 8.8.8.8                       # ICMP, infinite (Ctrl-C to stop)
+  agent-netx ping -1 8.8.8.8 --count 4          # --count mirrors hping3 -c
+  agent-netx ping -S -p 80 example.com          # TCP probe to port 80
+  agent-netx ping -2 -p 53 8.8.8.8 --count 3    # UDP to DNS port
+  agent-netx ping -1 8.8.8.8 --flood            # flood (admin only)
+  agent-netx ping -1 8.8.8.8 --traceroute --hops 20
+  agent-netx ping -1 8.8.8.8 -i u100000         # 100ms interval (microseconds)
+  agent-netx ping -1 8.8.8.8 -I eth0            # bind to interface
+
+Non-admin ICMP fails to open a raw socket; use -S/-2, or run elevated.
+-a (spoof) needs a raw socket and is rejected on Windows / non-admin.`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			url := "https://www.gstatic.com/generate_204"
-			if len(args) >= 1 {
-				url = args[0]
+			target := args[0]
+
+			if doTraceroute {
+				return netdiag.Traceroute(target, hops, os.Stdout)
 			}
 
-			var reg *proxy.Registry
-			cfgPath, _ := cmd.Flags().GetString("config")
-
-			if extraProxy != "" {
-				// Build a registry from --proxy (single probe). Optionally merge
-				// with the config registry if a config file exists.
-				u, err := parseProxyURL(extraProxy)
-				if err != nil {
-					return fmt.Errorf("parse --proxy URL: %w", err)
-				}
-				pcfg := config.ProxyConfig{
-					Name:   u.Scheme,
-					Type:   u.Scheme,
-					Server: u.Hostname(),
-					Port:   mustPort(u.Port()),
-				}
-				switch u.Scheme {
-				case "ss":
-					pcfg.Cipher = u.User.Username()
-					pass, _ := u.User.Password()
-					pcfg.Password = pass
-				case "http", "https":
-					pcfg.Username = u.User.Username()
-					pcfg.Password, _ = u.User.Password()
-				case "socks5":
-					pcfg.Username = u.User.Username()
-					pcfg.Password, _ = u.User.Password()
-				case "trojan":
-					pcfg.Password = u.User.Username()
-					pcfg.SNI = u.Query().Get("sni")
-				}
-				var pcfgs []config.ProxyConfig
-				if cfgPath != "" {
-					if _, err := os.Stat(cfgPath); err == nil {
-						if cfg, err := config.Load(cfgPath); err == nil {
-							pcfgs = append(pcfgs, cfg.Proxies...)
-						}
-					}
-				}
-				pcfgs = append(pcfgs, pcfg)
-				reg, err = proxy.Register(pcfgs)
-				if err != nil {
-					return fmt.Errorf("register proxies: %w", err)
-				}
-			} else {
-				// Config-required path (legacy behavior).
-				if cfgPath == "" {
-					cwd, _ := os.Getwd()
-					cfgPath = filepath.Join(cwd, "config.yml")
-				}
-				cfg, err := config.Load(cfgPath)
-				if err != nil {
-					return fmt.Errorf("load config: %w\nHint: use --proxy <url> to ping without a config file", err)
-				}
-				reg, err = proxy.Register(cfg.Proxies)
-				if err != nil {
-					return fmt.Errorf("register proxies: %w", err)
-				}
+			// 模式：显式 flag 覆盖默认 ICMP。优先级 TCP > UDP > ICMP，
+			// 因此同时给多个时后者语义为“更具体的覆盖”。
+			mode := netdiag.ProbeICMP
+			switch {
+			case modeTCP:
+				mode = netdiag.ProbeTCP
+			case modeUDP:
+				mode = netdiag.ProbeUDP
+			case modeICMP:
+				mode = netdiag.ProbeICMP
 			}
 
-			reg.Each(func(name string, p proxy.Proxy) {
-				l, err := p.Latency(url)
-				if err != nil {
-					fmt.Printf("  %-20s ERROR: %s\n", name, err.Error())
-				} else {
-					fmt.Printf("  %-20s %s\n", name, l.String())
-				}
+			interval, err := parseInterval(intervalStr)
+			if err != nil {
+				return err
+			}
+
+			opts := netdiag.ProbeOpts{
+				Target:      target,
+				Mode:        mode,
+				Count:       count,
+				Interval:    interval,
+				Timeout:     timeout,
+				DataSize:    dataSize,
+				Port:        port,
+				Interface:   iface,
+				Flood:       flood,
+				SpoofSource: spoof,
+				Verbose:     verbose,
+			}
+
+			// Count==0 为无限模式；无论是否无限，Ctrl-C 都应取消探测。
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go func() {
+				sigCh := make(chan os.Signal, 1)
+				signal.Notify(sigCh, os.Interrupt)
+				<-sigCh
+				fmt.Fprintln(os.Stderr, "\n^C — 正在停止…")
+				cancel()
+			}()
+
+			stats, err := netdiag.Probe(ctx, opts, func(s netdiag.ProbeSample) {
+				printProbeSample(opts, s)
 			})
+			if err != nil {
+				return err
+			}
+			fmt.Println()
+			fmt.Print(netdiag.FormatProbeStats(*stats))
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&extraProxy, "proxy", "", "test a single proxy URL (e.g. ss://aes-256-gcm:pass@host:port) — usable without a config file")
+	cmd.Flags().BoolVarP(&modeICMP, "icmp", "1", false, "ICMP echo mode (hping3 -1)")
+	cmd.Flags().BoolVarP(&modeTCP, "tcp", "S", false, "TCP connect probe mode (hping3 -S)")
+	cmd.Flags().BoolVarP(&modeUDP, "udp", "2", false, "UDP probe mode (hping3 -2)")
+	cmd.Flags().IntVar(&count, "count", 0, "number of probes (0 = infinite until Ctrl-C; mirrors hping3 -c)")
+	cmd.Flags().StringVarP(&intervalStr, "interval", "i", "1", "probe interval (hping3 -i; suffix u=µs, ms, s; bare = seconds)")
+	cmd.Flags().IntVarP(&dataSize, "data-size", "d", 0, "payload bytes (hping3 -d)")
+	cmd.Flags().IntVarP(&port, "port", "p", 0, "TCP/UDP port (default: TCP 80, UDP 33434)")
+	cmd.Flags().StringVarP(&iface, "interface", "I", "", "bind to interface name → source IPv4 (hping3 -I)")
+	cmd.Flags().BoolVarP(&verbose, "verbose", "V", false, "verbose output (hping3 -V)")
+	cmd.Flags().BoolVar(&flood, "flood", false, "send as fast as possible, no interval (hping3 --flood; admin only)")
+	cmd.Flags().StringVarP(&spoof, "spoof", "a", "", "spoof source address (hping3 -a; raw socket only)")
+	cmd.Flags().BoolVar(&doTraceroute, "traceroute", false, "run traceroute (delegates to tracert/traceroute) instead of probing")
+	cmd.Flags().IntVar(&hops, "hops", 30, "max hops for --traceroute")
+	cmd.Flags().DurationVarP(&timeout, "timeout", "W", time.Second, "per-probe timeout")
 	return cmd
+}
+
+// parseInterval 解析 hping3 -i 风格的间隔：后缀 u=微秒, ms=毫秒, s=秒,
+// 无后缀按秒计（与 hping3 默认单位一致）。
+func parseInterval(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, nil
+	}
+	var unit time.Duration = time.Second
+	num := s
+	switch {
+	case strings.HasSuffix(s, "u"): // microseconds (hping3 -i u1000)
+		unit = time.Microsecond
+		num = s[:len(s)-1]
+	case strings.HasSuffix(s, "ms"):
+		unit = time.Millisecond
+		num = s[:len(s)-2]
+	case strings.HasSuffix(s, "s"):
+		unit = time.Second
+		num = s[:len(s)-1]
+	}
+	f, err := strconv.ParseFloat(num, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid interval %q: %w", s, err)
+	}
+	return time.Duration(f * float64(unit)), nil
+}
+
+// printProbeSample 打印一行实时探测结果（hping3 风格）。
+func printProbeSample(opts netdiag.ProbeOpts, s netdiag.ProbeSample) {
+	mode := opts.Mode.String()
+	ms := float64(s.RTT.Microseconds()) / 1000.0
+	switch s.State {
+	case "reply", "open":
+		extra := ""
+		if s.RecvIP != "" {
+			extra += " from " + s.RecvIP
+		}
+		if s.TTL > 0 {
+			extra += fmt.Sprintf(" ttl=%d", s.TTL)
+		}
+		if s.RecvN > 0 {
+			extra += fmt.Sprintf(" bytes=%d", s.RecvN)
+		}
+		fmt.Printf("%s_seq=%-4d %s %.3fms%s\n", mode, s.Seq, probeStateTag(s.State), ms, extra)
+	default:
+		fmt.Printf("%s_seq=%-4d %s %s%s\n", mode, s.Seq, probeStateTag(s.State), s.State, probeErrTail(s.Err))
+	}
+}
+
+func probeStateTag(state string) string {
+	switch state {
+	case "reply", "open":
+		return "✔"
+	case "closed":
+		return "✗"
+	case "filtered":
+		return "?"
+	case "timeout":
+		return "⏱"
+	case "error":
+		return "!"
+	default:
+		return state
+	}
+}
+
+func probeErrTail(err error) string {
+	if err == nil {
+		return ""
+	}
+	return " (" + netdiag.ErrTail(err) + ")"
 }
 
 func useCmd() *cobra.Command {
@@ -587,7 +691,10 @@ func Execute() {
 		os.Setenv("AGENT_NETX_VERSION", Version)
 	}
 	checkUpdate()
-	// 彩色帮助/用法（对所有子命令生效，沿父链继承）。
+	// 运行时错误（如 ping --spoof 被拒）只打印错误本身；不追加 Usage/Help，
+	// 否则一次探测失败就刷出整屏帮助，把真正的原因淹没掉。参数/flag 解析错误
+	// 仍由 cobra 自带地打印用法（那些情况下用法提示是有用的）。
+	rootCmd.SilenceUsage = true
 	rootCmd.SetHelpFunc(styledHelp)
 	rootCmd.SetUsageFunc(func(cmd *cobra.Command) error {
 		styledHelp(cmd, nil)
