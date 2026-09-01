@@ -183,6 +183,9 @@ agent-netx [command]
 listen:
   http: 7890
   socks5: 7891
+  # tproxy: 7892      # Linux TProxy 透明监听端口
+  # tproxy-mark: 1    # 自动下发的 fwmark（0 = 不自动下发，用户自管）
+  # tproxy-table: 100 # 自动下发的 ip route local 表号
 
 mode: rule
 

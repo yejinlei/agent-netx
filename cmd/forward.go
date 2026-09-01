@@ -26,6 +26,7 @@ import (
 //	forward dynamic  <listen>                   (-D)   local SOCKS5 listener → any dst
 //	forward udp      <listen> <dst>             (-U)   local UDP listener → fixed UDP dst (DNS, etc.)
 //	forward tls      <listen> <dst> [sni]              HTTPS listener → plain-HTTP backend
+//	forward reverse  <listen> <target>            HTTP reverse proxy: 本地端口 → 固定上游 (mitmproxy reverse 模式)
 //
 // --proxy <name> routes the *destination dial* through a configured proxy
 // (resolved from config.yml), so forwarding can egress via SS/Trojan/etc.
@@ -42,6 +43,7 @@ func forwardCmd() *cobra.Command {
   forward dynamic <listen>                     # 本地 SOCKS5 监听 → 任意目标 (-D)
   forward udp     <listen> <dst>               # 本地 UDP 监听 → 固定 UDP 目标 (-U，DNS/QUIC 等)
   forward tls     <listen> <dst> [sni]         # HTTPS 监听 → 明文 HTTP 后端
+  forward reverse <listen> <target>          # HTTP 反向代理：本地端口 → 固定上游 (mitmproxy reverse)
 
 --proxy <name>  让目标拨号走配置文件里的指定代理（SS/Trojan 等）；不指定则直连。
   forward local :8080 example.com:80 --proxy prod-ss
@@ -52,7 +54,8 @@ func forwardCmd() *cobra.Command {
   agent-netx forward dynamic 1080
   agent-netx forward remote prod :9090 127.0.0.1:8080
   agent-netx forward udp 127.0.0.1:1053 1.1.1.1:53 --proxy prod-socks5
-  agent-netx forward tls 0.0.0.0:443 127.0.0.1:80`,
+  agent-netx forward tls 0.0.0.0:443 127.0.0.1:80
+  agent-netx forward reverse :8080 https://internal.example.com:9090`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 0 {
 				return fmt.Errorf("usage: forward <local|remote|dynamic|tls> ...")
@@ -89,8 +92,10 @@ func forwardCmd() *cobra.Command {
 				return forwardUDP(ctx, rest, cmd, proxyName)
 			case "tls":
 				return forwardTLS(ctx, rest)
+			case "reverse":
+				return forwardReverse(ctx, rest)
 			default:
-				return fmt.Errorf("unknown mode %q (want local|remote|dynamic|udp|tls)", mode)
+				return fmt.Errorf("unknown mode %q (want local|remote|dynamic|udp|tls|reverse)", mode)
 			}
 		},
 	}
@@ -205,6 +210,13 @@ func forwardTLS(ctx context.Context, args []string) error {
 		sni = args[2]
 	}
 	return forward.TLS(ctx, args[0], args[1], sni)
+}
+
+func forwardReverse(ctx context.Context, args []string) error {
+	if len(args) < 2 {
+		return fmt.Errorf("usage: forward reverse <listen> <target>")
+	}
+	return forward.Reverse(ctx, args[0], args[1])
 }
 
 // forwardRemote implements -R: open a listener ON a remote SSH host (resolved

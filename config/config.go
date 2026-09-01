@@ -67,6 +67,15 @@ type Listen struct {
 	HTTP     int `yaml:"http"`
 	SOCKS5   int `yaml:"socks5"`
 	TProxy   int `yaml:"tproxy"` // Linux TProxy listener (iptables TPROXY redirect target)
+	// TProxyMark is the SO_MARK / ip rule fwmark used by the Linux TProxy
+	// routing loop: iptables marks packets 0xMARK, then `ip rule` routes
+	// fwmark MARK into the local routing table. It must equal the --set-mark
+	// in the user's `iptables -j TPROXY --tproxy-mark` rule. 0 disables the
+	// auto-installed routing loop (TProxy listener still works; user owns the
+	// routing rules). Default: 1.
+	TProxyMark int `yaml:"tproxy-mark"`
+	// TProxyTable is the ip route local table used with TProxyMark. Default: 100.
+	TProxyTable int `yaml:"tproxy-table"`
 }
 
 type ProxyConfig struct {
@@ -160,6 +169,12 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Listen.SOCKS5 == 0 {
 		cfg.Listen.SOCKS5 = 7891
+	}
+	if cfg.Listen.TProxyMark == 0 {
+		cfg.Listen.TProxyMark = 1
+	}
+	if cfg.Listen.TProxyTable == 0 {
+		cfg.Listen.TProxyTable = 100
 	}
 	if cfg.Mode == "" {
 		cfg.Mode = "rule"
@@ -274,6 +289,12 @@ func LoadFromBytes(data []byte) (*Config, error) {
 	}
 	if cfg.Listen.SOCKS5 == 0 {
 		cfg.Listen.SOCKS5 = 7891
+	}
+	if cfg.Listen.TProxyMark == 0 {
+		cfg.Listen.TProxyMark = 1
+	}
+	if cfg.Listen.TProxyTable == 0 {
+		cfg.Listen.TProxyTable = 100
 	}
 	if cfg.Mode == "" {
 		cfg.Mode = "rule"
@@ -428,6 +449,9 @@ const ExampleConfig = `
 listen:
   http: 7890
   socks5: 7891
+  # tproxy: 7892      # Linux TProxy listener (iptables TPROXY redirect target)
+  # tproxy-mark: 1    # fwmark for the auto-installed routing loop (0 = manual)
+  # tproxy-table: 100 # ip route local table used with tproxy-mark
 
 # Mode: global / rule / direct
 mode: rule

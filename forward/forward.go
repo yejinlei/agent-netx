@@ -27,6 +27,9 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"strconv"
 	"time"
 )
@@ -376,4 +379,66 @@ func readSOCKS5Addr(c net.Conn, atyp byte) (host string, port int, ok bool) {
 		return "", 0, false
 	}
 	return host, int(uint16(pb[0])<<8|uint16(pb[1])), true
+}
+
+// Reverse starts an HTTP reverse proxy: listens on `listen` (host:port), and
+// forwards every request to `targetURL` (e.g. "https://internal.example.com:8080").
+// This is the mitmproxy `reverse:https://target` mode: a fixed upstream with no
+// client choice, in contrast to Local/Dynamic which pick the destination per
+// connection.
+//
+// Behavior:
+//   - Host header is rewritten to the upstream's host so the backend sees the
+//     virtual host it's bound to.
+//   - X-Forwarded-For/Proto/Host are set to preserve client origin.
+//   - TLS is terminated on the way to the upstream (using the target's own
+//     certificate); if the upstream needs SNI validation you can point it at
+//     plain http://. Listener side is plain TCP (caller/agent should wrap in
+//     TLS if it wants to serve HTTPS externally).
+func Reverse(ctx context.Context, listen, targetURL string) error {
+	target, err := url.Parse(targetURL)
+	if err != nil {
+		return fmt.Errorf("reverse target %q: %w", targetURL, err)
+	}
+	if target.Scheme != "http" && target.Scheme != "https" {
+		return fmt.Errorf("reverse target scheme must be http or https, got %q", target.Scheme)
+	}
+	if target.Host == "" {
+		return fmt.Errorf("reverse target %q: missing host", targetURL)
+	}
+
+	rp := httputil.NewSingleHostReverseProxy(target)
+	rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		log.Printf("reverse: %s → %s: %v", r.RemoteAddr, targetURL, err)
+		http.Error(w, "upstream unavailable", http.StatusBadGateway)
+	}
+	rp.Director = func(req *http.Request) {
+		req.URL.Scheme = target.Scheme
+		req.URL.Host = target.Host
+		req.Host = target.Host
+		req.Header.Set("X-Forwarded-For", req.RemoteAddr)
+		if req.Header.Get("X-Forwarded-Proto") == "" {
+			req.Header.Set("X-Forwarded-Proto", "http")
+		}
+	}
+	rp.Transport = &http.Transport{
+		DialContext: (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+
+	ln, err := net.Listen("tcp", listen)
+	if err != nil {
+		return fmt.Errorf("reverse listen %s: %w", listen, err)
+	}
+	defer ln.Close()
+	srv := &http.Server{
+		Handler:           rp,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	log.Printf("reverse: %s → %s", listen, targetURL)
+
+	ch := make(chan error, 1)
+	go func() { ch <- srv.Serve(ln) }()
+	go func() { <-ctx.Done(); srv.Close() }()
+	return <-ch
 }

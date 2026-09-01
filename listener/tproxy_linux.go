@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
+	"strconv"
+	"strings"
 	"sync"
 
 	"golang.org/x/sys/unix"
@@ -68,7 +71,11 @@ type tproxyListener struct {
 
 func (l *tproxyListener) Accept() (net.Conn, error) {
 	for {
-		cfd, _, err := unix.Accept(l.fd)
+		// unix.Accept returns the peer (client) sockaddr as its second value.
+		// Under TPROXY the client source is unchanged on the connection, so this
+		// is the real client address — distinct from the (redirected) target we
+		// read below via IP_ORIGDSTADDR.
+		cfd, peerSA, err := unix.Accept(l.fd)
 		if err != nil {
 			return nil, err
 		}
@@ -78,11 +85,13 @@ func (l *tproxyListener) Accept() (net.Conn, error) {
 		}
 		orig := origDst(cfd)
 		if orig == nil {
-			if orig, err = peerTCPAddr(cfd); err != nil {
-				unix.Close(cfd)
-				continue
-			}
+			// We cannot safely guess the target without IP_ORIGDSTADDR. Fail
+			// closed rather than reusing the client address as the target
+			// (that poison made every conn look like it targeted itself).
+			unix.Close(cfd)
+			continue
 		}
+		client := sockToTCPAddr(peerSA)
 		f := os.NewFile(uintptr(cfd), fmt.Sprintf("tproxy-conn-%d", cfd))
 		conn, err := net.FileConn(f)
 		f.Close()
@@ -94,7 +103,7 @@ func (l *tproxyListener) Accept() (net.Conn, error) {
 			conn.Close()
 			return nil, fmt.Errorf("net.FileConn returned non-Conn")
 		}
-		return &tproxyConn{Conn: tc, orig: orig}, nil
+		return &tproxyConn{Conn: tc, orig: orig, client: client}, nil
 	}
 }
 
@@ -112,21 +121,21 @@ func (l *tproxyListener) Addr() net.Addr { return l.addr }
 
 type tproxyConn struct {
 	net.Conn
-	orig *net.TCPAddr
+	orig   *net.TCPAddr
+	client *net.TCPAddr
 }
 
 func (c *tproxyConn) RemoteAddr() net.Addr { return c.orig }
+func (c *tproxyConn) ClientAddr() net.Addr { return c.client }
 
-func peerTCPAddr(fd int) (*net.TCPAddr, error) {
-	sa, err := unix.Getpeername(fd)
-	if err != nil {
-		return nil, err
-	}
+// sockToTCPAddr turns a SockaddrInet4 (typically the peer returned by Accept)
+// into a *net.TCPAddr. Returns nil when the family is not IPv4.
+func sockToTCPAddr(sa unix.Sockaddr) *net.TCPAddr {
 	pa, ok := sa.(*unix.SockaddrInet4)
-	if !ok {
-		return nil, fmt.Errorf("peer addr is not IPv4: %T", sa)
+	if !ok || pa == nil {
+		return nil
 	}
-	return &net.TCPAddr{IP: net.IP(pa.Addr[:]), Port: pa.Port}, nil
+	return &net.TCPAddr{IP: net.IP(pa.Addr[:]), Port: pa.Port}
 }
 
 func origDst(fd int) *net.TCPAddr {
@@ -155,6 +164,54 @@ func origDst(fd int) *net.TCPAddr {
 			IP:   net.IPv4(msg.Data[4], msg.Data[5], msg.Data[6], msg.Data[7]),
 			Port: int(port),
 		}
+	}
+	return nil
+}
+
+// fwmarkRoute installs the ip-rule / ip-route half of a Linux TPROXY redirect
+// loop so redirected packets route back to this host instead of looping:
+//
+//	ip rule add fwmark MARK lookup TABLE
+//	ip route add local 0.0.0.0/0 dev lo table TABLE
+//
+// MARK is the value matching the user's iptables `--set-mark` / `--tproxy-mark`
+// rule; TABLE is the local routing table. 0 for either argument disables the
+// auto-installed loop (the user owns the routing rules). The iptables TPROXY
+// target rule itself is left to the user / systemd unit. Idempotent on a
+// second install: `ip rule`/`ip route add` fail harmlessly if the entry
+// already exists (silenced). Requires CAP_NET_ADMIN.
+func installTProxyRouting(mark, table int) error {
+	if mark == 0 || table == 0 {
+		return nil // user manages routing
+	}
+	if err := runIP(strings.Fields("rule add fwmark " + strconv.Itoa(mark) + " lookup " + strconv.Itoa(table))); err != nil {
+		return fmt.Errorf("tproxy routing ip rule: %w", err)
+	}
+	if err := runIP(strings.Fields("route add local 0.0.0.0/0 dev lo table " + strconv.Itoa(table))); err != nil {
+		// Best-effort teardown of the rule we just added so we don't leave a
+		// half-installed loop.
+		runIP(strings.Fields("rule del fwmark " + strconv.Itoa(mark) + " lookup " + strconv.Itoa(table)))
+		return fmt.Errorf("tproxy routing ip route: %w", err)
+	}
+	return nil
+}
+
+// teardownTProxyRouting removes the ip-rule / ip-route entries installed by
+// installTProxyRouting. Silently swallows "no such rule/route" so Stop is safe
+// to call when routing was never installed or was removed externally.
+func teardownTProxyRouting(mark, table int) {
+	if mark == 0 || table == 0 {
+		return
+	}
+	runIP(strings.Fields("rule del fwmark " + strconv.Itoa(mark) + " lookup " + strconv.Itoa(table)))
+	runIP(strings.Fields("route del local 0.0.0.0/0 dev lo table " + strconv.Itoa(table)))
+}
+
+func runIP(args []string) error {
+	cmd := exec.Command("ip", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s: %w (%s)", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

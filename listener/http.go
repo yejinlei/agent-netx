@@ -21,6 +21,11 @@ type Options struct {
 	HTTPPort    int
 	SOCKS5Port  int
 	TProxyPort  int
+	// TProxyMark / TProxyTable drive the Linux TPROXY routing loop
+	// (ip rule + ip route local). Passed to installTProxyRouting/teardown.
+	// Zero disables auto-installation (user owns routing rules).
+	TProxyMark  int
+	TProxyTable int
 	Router      *router.Router
 	// Stats optionally receives per-proxy traffic + connection accounting.
 	// nil disables accounting (no overhead).
@@ -75,12 +80,17 @@ func (l *Listener) Start() error {
 	if l.opts.TProxyPort > 0 {
 		ln, err := tproxyListen(fmt.Sprintf(":%d", l.opts.TProxyPort))
 		if err != nil {
-			l.Stop()
+			l.tproxyLn.Close()
 			return fmt.Errorf("tproxy listen :%d: %w", l.opts.TProxyPort, err)
 		}
 		l.mu.Lock()
 		l.tproxyLn = ln
 		l.mu.Unlock()
+		if err := installTProxyRouting(l.opts.TProxyMark, l.opts.TProxyTable); err != nil {
+			ln.Close()
+			teardownTProxyRouting(l.opts.TProxyMark, l.opts.TProxyTable)
+			return fmt.Errorf("tproxy routing: %w", err)
+		}
 		go l.serveTProxy(ln)
 	}
 
@@ -118,6 +128,7 @@ func (l *Listener) Stop() {
 	if tproxyLn != nil {
 		tproxyLn.Close()
 	}
+	teardownTProxyRouting(l.opts.TProxyMark, l.opts.TProxyTable)
 	if stopCh != nil {
 		close(stopCh)
 	}
@@ -488,6 +499,22 @@ func (c *statsConn) Write(b []byte) (int, error) {
 	return n, err
 }
 
+// connWithClientAddr is implemented by listener-side connection types that
+// know the real client source address (e.g. TProxy, where RemoteAddr is the
+// original target after redirect). nil is fine to return.
+type connWithClientAddr interface {
+	ClientAddr() net.Addr
+}
+
+func clientAddrStr(conn net.Conn) string {
+	if c, ok := conn.(connWithClientAddr); ok {
+		if ca := c.ClientAddr(); ca != nil {
+			return ca.String()
+		}
+	}
+	return conn.RemoteAddr().String()
+}
+
 // relay copies bidirectionally between client and remote, optionally counting
 // bytes under proxyName. It tracks active connections on the tracker too.
 // Blocks until one direction closes; closes both ends.
@@ -539,6 +566,10 @@ func (l *Listener) handleTProxy(conn net.Conn) {
 		ta = &net.TCPAddr{IP: ta.IP, Port: 443}
 	}
 	target := ta.String()
+	client := clientAddrStr(conn)
+	if client != "" {
+		log.Printf("tproxy: %s -> %s", client, target)
+	}
 
 	p, err := l.opts.Router.Pick(target)
 	if err != nil {

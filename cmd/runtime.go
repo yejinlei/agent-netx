@@ -102,6 +102,8 @@ func runProxy(ctx context.Context, cfg *config.Config, logRing *web.LogRing, sta
 		HTTPPort:    cfg.Listen.HTTP,
 		SOCKS5Port:  cfg.Listen.SOCKS5,
 		TProxyPort:  cfg.Listen.TProxy,
+		TProxyMark:  cfg.Listen.TProxyMark,
+		TProxyTable: cfg.Listen.TProxyTable,
 		Router:      rtr,
 		Stats:       stats,
 	})
