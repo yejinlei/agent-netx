@@ -5,40 +5,42 @@
     "title": "代理监听与路由架构",
     "output": "proxy.html",
     "quality_profile": "showcase",
-    "viewBox": [
-      1080,
-      500
-    ]
+    "viewBox": [1080, 560]
   },
   "components": [
     {
-      "id": "client",
+      "id": "httpClient",
       "type": "external",
-      "label": "客户端流量",
-      "sublabel": "HTTP CONNECT / SOCKS5",
-      "pos": [
-        40,
-        240
-      ],
-      "size": [
-        140,
-        60
-      ]
+      "label": "HTTP/SOCKS5 客户端",
+      "sublabel": "CONNECT / UDP ASSOCIATE",
+      "pos": [40, 110],
+      "size": [150, 56]
+    },
+    {
+      "id": "tproxySrc",
+      "type": "external",
+      "label": "透明流量入口",
+      "sublabel": "iptables TPROXY + fwmark",
+      "pos": [40, 360],
+      "size": [150, 56]
     },
     {
       "id": "listener",
       "type": "backend",
-      "label": "监听 :7890/:7891",
-      "sublabel": "HTTP + SOCKS5",
+      "label": "HTTP + SOCKS5 监听",
+      "sublabel": ":7890 / :7891",
       "tag": "listener.New",
-      "pos": [
-        230,
-        240
-      ],
-      "size": [
-        160,
-        60
-      ]
+      "pos": [260, 110],
+      "size": [170, 56]
+    },
+    {
+      "id": "tproxyListener",
+      "type": "security",
+      "label": "TPROXY 透明监听",
+      "sublabel": "IP_TRANSPARENT · client+orig",
+      "tag": "tproxy.Listen",
+      "pos": [260, 360],
+      "size": [210, 56]
     },
     {
       "id": "router",
@@ -46,14 +48,8 @@
       "label": "Router",
       "sublabel": "global / rule / direct",
       "tag": "router.New",
-      "pos": [
-        460,
-        240
-      ],
-      "size": [
-        140,
-        60
-      ]
+      "pos": [510, 240],
+      "size": [140, 56]
     },
     {
       "id": "registry",
@@ -61,114 +57,41 @@
       "label": "Proxy 注册表",
       "sublabel": "ss / trojan / vmess ...",
       "tag": "proxy.Register",
-      "pos": [
-        670,
-        240
-      ],
-      "size": [
-        150,
-        60
-      ]
-    },
-    {
-      "id": "chain",
-      "type": "security",
-      "label": "Chain",
-      "sublabel": "代理串接",
-      "tag": "chain",
-      "pos": [
-        880,
-        100
-      ],
-      "size": [
-        140,
-        60
-      ]
-    },
-    {
-      "id": "stats",
-      "type": "database",
-      "label": "StatsTracker",
-      "sublabel": "流量统计",
-      "pos": [
-        460,
-        400
-      ],
-      "size": [
-        140,
-        60
-      ]
+      "pos": [700, 240],
+      "size": [150, 56]
     },
     {
       "id": "target",
       "type": "cloud",
       "label": "目标服务",
       "sublabel": "远程上游",
-      "pos": [
-        900,
-        380
-      ],
-      "size": [
-        140,
-        60
-      ]
+      "pos": [880, 240],
+      "size": [120, 56]
+    },
+    {
+      "id": "stats",
+      "type": "database",
+      "label": "StatsTracker",
+      "sublabel": "两路监听均计量",
+      "pos": [40, 490],
+      "size": [150, 46]
     }
   ],
   "boundaries": [
     {
       "kind": "region",
       "label": "proxy 子命令域",
-      "wraps": [
-        "listener",
-        "router",
-        "registry",
-        "chain",
-        "stats"
-      ]
+      "wraps": ["listener", "tproxyListener", "router", "registry", "stats"]
     }
   ],
   "connections": [
-    {
-      "id": "c1",
-      "from": "client",
-      "to": "listener",
-      "label": "TCP"
-    },
-    {
-      "id": "c2",
-      "from": "listener",
-      "to": "router",
-      "label": "Pick"
-    },
-    {
-      "id": "c3",
-      "from": "router",
-      "to": "registry",
-      "label": "解析 proxy 名"
-    },
-    {
-      "id": "c4",
-      "from": "registry",
-      "to": "target",
-      "label": "Connect(ctx, addr)"
-    },
-    {
-      "id": "c5",
-      "from": "router",
-      "to": "chain",
-      "label": "chain 子代理",
-      "fromSide": "top",
-      "toSide": "bottom",
-      "variant": "dashed"
-    },
-    {
-      "id": "c6",
-      "from": "listener",
-      "to": "stats",
-      "label": "RecordTraffic",
-      "fromSide": "bottom",
-      "toSide": "top"
-    }
+    {"id": "c1", "from": "httpClient", "to": "listener", "label": "TCP"},
+    {"id": "c2", "from": "tproxySrc", "to": "tproxyListener", "label": "TPROXY redirect", "labelAt": [180, 295]},
+    {"id": "c3", "from": "listener", "to": "router", "label": "Pick(addr)"},
+    {"id": "c4", "from": "tproxyListener", "to": "router", "label": "Pick(addr, client)"},
+    {"id": "c5", "from": "router", "to": "registry", "label": "解析 proxy 名", "labelAt": [625, 195]},
+    {"id": "c6", "from": "registry", "to": "target", "label": "Connect", "labelAt": [865, 195]},
+    {"id": "c7", "from": "tproxyListener", "to": "stats", "label": "RecordTraffic"}
   ],
   "cards": [
     {
@@ -176,7 +99,7 @@
       "title": "协议支持",
       "items": [
         "Shadowsocks / HTTP(S) / SOCKS5 / Trojan",
-        "VMess / VLESS / FRP / HTTP3 (QUIC)",
+        "VMess / VLESS / HTTP3 (QUIC)",
         "Chain 支持多代理串接"
       ]
     },
@@ -185,17 +108,17 @@
       "title": "路由模式",
       "items": [
         "global: 全部流量走一个代理",
-        "rule: 按域名/IP 规则分流",
+        "rule: 按域名 / IP 规则分流",
         "direct: 直连 + 走组选择器"
       ]
     },
     {
       "dot": "rose",
-      "title": "用法",
+      "title": "TPROXY 透明代理",
       "items": [
-        "proxy (读取 config.yml)",
-        "--config path/to/config.yml",
-        "配合 web 仪表盘查看流量"
+        "iptables -j TPROXY 重定向入口流量",
+        "fwmark 路由环：ip rule + ip route local",
+        "正确分离客户端与原始目标地址"
       ]
     }
   ]

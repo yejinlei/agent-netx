@@ -2,39 +2,63 @@
   "schema_version": 1,
   "diagram_type": "architecture",
   "meta": {
-    "title": "Agent — LLM 驱动的配置生成器",
+    "title": "Agent — 22+ 工具的自然语言入口",
     "output": "agent.html",
     "quality_profile": "showcase",
+    "viewBox": [1080, 560],
     "views": [
-      { "id": "input-path", "label": "自然语言 → 配置写入", "focus": ["user", "tui", "agent", "registry", "memory", "config"], "note": "用户中文输入经 Agent 解析后落入工具/配置。" },
-      { "id": "llm-loop", "label": "LLM 往返调用", "focus": ["agent", "llm"], "note": "Agent 与 OpenAI 兼容 API 之间的往返。" },
-      { "id": "persist", "label": "持久化路径", "focus": ["agent", "registry", "memory", "config"], "note": "工具调用最终落到记忆库和 config.yml。" }
+      { "id": "tool-map", "label": "工具域全景", "focus": ["user", "tui", "agent", "llm", "registry", "cfg", "fwd", "diag", "parity"], "note": "registry 把 50 个 tool 分到四个域：配置会话、转发隧道、诊断运行、mitmproxy 兼容。" }
     ]
   },
   "components": [
-    { "id": "user", "type": "external", "label": "用户 (终端)", "sublabel": "自然语言", "pos": [40, 280], "size": [120, 60] },
-    { "id": "tui", "type": "frontend", "label": "TUI 交互层", "sublabel": "Kimi 风格", "pos": [210, 280], "size": [140, 60] },
-    { "id": "agent", "type": "backend", "label": "LLM Agent", "sublabel": "system prompt · tool registry", "pos": [420, 170], "size": [170, 90], "tag": "P0 核心" },
-    { "id": "llm", "type": "cloud", "label": "Agent API", "sublabel": "OpenAI-compatible base-url", "pos": [880, 90], "size": [150, 60] },
-    { "id": "registry", "type": "database", "label": "工具注册表", "sublabel": "tools / dispatch", "pos": [420, 410], "size": [170, 60] },
-    { "id": "memory", "type": "database", "label": "记忆库", "sublabel": "config.yml + memory/", "pos": [640, 410], "size": [140, 60] },
-    { "id": "config", "type": "database", "label": "config.yml", "sublabel": "写入配置", "pos": [840, 410], "size": [150, 60] }
+    { "id": "user", "type": "external", "label": "用户 (终端)", "sublabel": "自然语言", "pos": [30, 40], "size": [110, 50] },
+    { "id": "tui", "type": "frontend", "label": "TUI 交互层", "sublabel": "Kimi 风格", "pos": [200, 40], "size": [150, 50] },
+    { "id": "agent", "type": "backend", "label": "LLM Agent", "sublabel": "system prompt · dispatch", "pos": [420, 40], "size": [170, 50], "tag": "P0 核心" },
+    { "id": "llm", "type": "cloud", "label": "Agent API", "sublabel": "OpenAI-compatible", "pos": [670, 40], "size": [160, 50] },
+    { "id": "registry", "type": "database", "label": "工具注册表", "sublabel": "50 工具 · 4 域", "pos": [420, 200], "size": [170, 60] },
+    { "id": "cfg", "type": "database", "label": "配置 · 会话", "sublabel": "13 tools · YAML/memory/", "pos": [30, 370], "size": [220, 60] },
+    { "id": "fwd", "type": "backend", "label": "转发 · 隧道", "sublabel": "15 tools · pid lifecycle", "pos": [290, 370], "size": [220, 60] },
+    { "id": "diag", "type": "security", "label": "诊断 · 运行", "sublabel": "17 tools · netdiag/ping", "pos": [560, 370], "size": [220, 60] },
+    { "id": "parity", "type": "external", "label": "mitmproxy 兼容", "sublabel": "5 stubs · 暂未实现", "pos": [830, 370], "size": [170, 60] }
   ],
   "boundaries": [
-    { "kind": "region", "label": "LLM Agent 子命令域", "wraps": ["tui", "agent", "llm", "registry", "memory", "config"] }
+    { "kind": "region", "label": "Agent 域 · 工具调度层", "wraps": ["user", "tui", "agent", "llm", "registry", "cfg", "fwd", "diag", "parity"] }
   ],
   "connections": [
-    { "id": "c1", "from": "user", "to": "tui", "label": "自然语言输入", "variant": "emphasis", "labelAt": [185, 354] },
-    { "id": "c2", "from": "tui", "to": "agent", "label": "系统提示 + 历史消息", "labelAt": [385, 274] },
-    { "id": "c3", "from": "agent", "to": "llm", "label": "gpt-4o / claude", "fromSide": "right", "toSide": "left" },
-    { "id": "c4", "from": "llm", "to": "agent", "label": "文本 / tool-calls", "variant": "dashed", "fromSide": "bottom", "toSide": "top", "via": [[955, 160], [955, 40], [505, 40], [505, 165]], "labelAt": [730, 35] },
-    { "id": "c5", "from": "agent", "to": "registry", "label": "tool-call dispatch", "fromSide": "bottom", "toSide": "top", "labelAt": [505, 310] },
-    { "id": "c6", "from": "registry", "to": "memory", "label": "读写" },
-    { "id": "c7", "from": "memory", "to": "config", "label": "写入配置" }
+    { "id": "c1", "from": "user", "to": "tui", "label": "自然语言", "variant": "emphasis", "labelAt": [155, 130] },
+    { "id": "c2", "from": "tui", "to": "agent", "label": "消息+历史", "labelAt": [385, 130] },
+    { "id": "c3", "from": "agent", "to": "llm", "label": "API 请求", "labelAt": [610, 130] },
+    { "id": "c4", "from": "llm", "to": "agent", "label": "tool-calls", "variant": "dashed", "labelAt": [610, 100] },
+    { "id": "c5", "from": "agent", "to": "registry", "label": "dispatch", "labelAt": [515, 170] },
+    { "id": "c6", "from": "registry", "to": "cfg", "label": "读写", "fromSide": "bottom", "toSide": "top", "labelAt": [330, 290] },
+    { "id": "c7", "from": "registry", "to": "fwd", "label": "启动+PID", "fromSide": "bottom", "toSide": "top", "labelAt": [470, 290] },
+    { "id": "c8", "from": "registry", "to": "diag", "label": "查询", "fromSide": "bottom", "toSide": "top", "labelAt": [700, 290] },
+    { "id": "c9", "from": "registry", "to": "parity", "label": "fallback", "variant": "dashed", "fromSide": "bottom", "toSide": "top", "labelAt": [940, 290] }
   ],
   "cards": [
-    { "dot": "cyan", "title": "支持的工具", "items": ["ping_proxies", "use_config / switch_group", "gen_config", "file_copy (scp)", "remember / recall", "ssh_config"] },
-    { "dot": "emerald", "title": "配置", "items": ["base-url / api-key / model 在 agent.yml", "支持本地、自建、官方 OpenAI 兼容 API", "memory/ 跨会话持久化"] },
-    { "dot": "rose", "title": "交互风格", "items": ["Kimi 风格 TUI：顶端版本框 + 提示行", "用户消息 ✨ / AI 回复 ●", "状态栏：base · 版本 · context 用量"] }
+    {
+      "dot": "cyan",
+      "title": "配置 · 会话 (13)",
+      "items": [
+        "get_config / update_config / gen_config / add_proxy / add_rule",
+        "session_save / load / list / export / import / remember / recall"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "转发 · 隧道 (15)",
+      "items": [
+        "forward_reverse/local/dynamic/udp/tls · socat · corsproxy",
+        "wireguard / tinc / frp / tun / n2n / stunvpv / tproxy / mitm"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "诊断 · 运行 (17) · mitmproxy stub (5)",
+      "items": [
+        "net_connections / listeners / packets / ping / stats / sysproxy",
+        "run / run_local / run_remote · init / list_commands / logs_tail"
+      ]
+    }
   ]
 }
