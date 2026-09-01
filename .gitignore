@@ -49,3 +49,8 @@ certs/
 .claude/worktrees/
 agent.yml
 _releases/
+
+# Scratch build / patching scripts (one-off per session)
+build/
+tmp/
+*.py
