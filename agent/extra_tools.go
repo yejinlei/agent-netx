@@ -15,6 +15,7 @@ func (r *Registry) registerExtra() {
 	r.registerSessionImport()
 	r.registerAddProxy()
 	r.registerAddRule()
+	r.registerCommands()
 }
 
 func (r *Registry) registerSessionExport() {
