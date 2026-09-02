@@ -607,6 +607,30 @@ Reality 让 TLS 握手看起来像真实浏览器(**Chrome/Firefox/iOS/Edge/Rand
 
 **平台**:🌐 全平台。
 
+#### 是什么 / 为什么测 / 与相近功能对比 / 测试要点
+
+**这是什么**:所有 agent-netx 命令的入口层。init 生成配置文件,start 拉起主进程,validate 在启动前检查配置语义,logs/stop/restart/use 是运行时运维。
+
+**数据流向(以 start 为例)**:
+```
+[agent-netx start]──加载 config.yml──► [Listener 起 HTTP/SOCKS5/TProxy]
+                                      └──[子服务 TUN/DNS/MITM/N2N 等]
+                                      └──[写 PID 文件]
+```
+
+**与相近功能对比**:
+
+| 命令 | 同类工具 | 区别 |
+|------|---------|------|
+| init | Clash 手写 Clash.yaml | 一键生成,带默认值,零门槛 |
+| validate | yamllint | 不仅检查语法,还校验端口范围/代理名重复/CIDR 合法性 |
+| use | Clash Web UI 切换 | CLI 一步到位,写回 config.yml 持久化 |
+| start --proxy <url> | SS/Trojan 各自客户端 | 一个命令支持 5 种代理协议 URL |
+
+**为什么先测它**:init 不通→后面所有命令无配置可用;validate 不通→配置错误启动才报错;logs/stop 不通→排障无门。
+
+**测试要点**:init 后确认生成了两个文件;validate 返回空;start 起不来→先看 logs。
+
 **`start --proxy <url>` 支持的 URL 形式**:
 - `ss://aes-256-gcm:password@server:8388`
 - `http://user:pass@server:443`
@@ -619,6 +643,22 @@ Reality 让 TLS 握手看起来像真实浏览器(**Chrome/Firefox/iOS/Edge/Rand
 ### 6.2 独立子服务
 
 🌐 全平台。`--no-tun` 仅用于 `tun/n2n/stunvpv/wireguard`(跳过 TUN 桥接,只测 UDP 通道)。
+
+#### 是什么 / 为什么测 / 与相近功能对比 / 测试要点
+
+**这是什么**:把 start 一次性拉起的多个子系统拆成独立命令,各自可单独起/停/测。这是排障和最小化测试的核心手段。
+
+**与 start 对比**:
+
+| 命令 | 与 start 的区别 |
+|------|----------------|
+| proxy | 只起 HTTP+SOCKS5,不起 TUN/DNS/WEB/MITM |
+| tun --no-tun | 起 TUN 设备但跳过桥接,只测 UDP 通道本身 |
+| frp server/client | 独立 FRP 角色,不依赖主 config |
+
+**为什么单独测**:出问题(比如 TUN 起不来)时,先独立起 tun 确认是不是 TUN 设备本身的问题,而不是被其他子系统干扰。
+
+**测试要点**:每个子命令各跑一次,确认日志里只出现该子系统的初始化信息。
 每个网络子服务都能脱离整体单独跑,便于排障:
 
 ```powershell
@@ -641,6 +681,25 @@ agent-netx corsproxy --port 8080       # CORS 代理
 ### 6.3 端口转发 (forward)
 
 🌐 全平台。`remote` 模式两边都需 SSH 可达。SSH 同款 6 种模式,`--proxy <name>` 让"目标拨号"走配置文件里指定的代理(不指定则直连):
+
+#### 是什么 / 为什么测 / 与相近功能对比 / 测试要点
+
+**这是什么**:在本地或远端开一个监听端口,把流量转发到目标地址。本质是单向端口映射,类似 SSH 的 -L/-R/-D,但多了 6 种模式覆盖更多场景。
+
+**与 SSH 对比**:
+
+| 场景 | SSH | agent-netx forward |
+|------|-----|--------------------|
+| 本地端口转发 | -L | forward local |
+| 远程端口转发 | -R | forward remote(复用 SSH,加 --proxy 可走代理) |
+| 动态 SOCKS5 | -D | forward dynamic |
+| UDP 转发 | 需 socat | forward udp 原生支持 |
+| TLS 终止后转发 | 需 stunnel | forward tls 原生支持 |
+| HTTP 反向代理 | 需 nginx | forward reverse |
+
+**为什么先测 local**:local 是最简单的 TCP 转发,零外部依赖,能验证"监听→拨号→双向 pump"这条核心链路。
+
+**测试要点**:本机开两个服务,用 forward 把 A 的端口映射到 B 的端口,curl 验证。
 
 **原理图**:
 ```
@@ -693,6 +752,23 @@ agent-netx forward reverse :8080 https://internal.example.com:9090
 
 🌐 全平台。纯 socket,零依赖。**不需要配置文件**,纯命令行。端点用 socat 风格地址:
 
+#### 是什么 / 为什么测 / 与相近功能对比 / 测试要点
+
+**这是什么**:纯 socket 双向中继,不依赖配置文件,纯命令行。把两个 socket 端点(TCP 监听、UDP 监听、TCP 拨号、UDP 拨号)连起来,数据双向透传。
+
+**与 forward 的区别**:
+
+| 维度 | socat | forward |
+|------|-------|---------|
+| 依赖 | 零,不读 config.yml | 依赖 config.yml 的代理 |
+| 端点灵活度 | 极高(TCP/UDP 自由组合) | 固定 6 种模式 |
+| 协议层 | 只透传字节 | 带 --proxy 支持走代理 |
+| 适用 | 临时调试、端口映射 | 长期运行、与主 config 联动 |
+
+**为什么测它**:当 forward 出了问题,用 socat 绕过配置层直测 socket 转发本身,快速定位问题在配置还是 socket。
+
+**测试要点**:起 socat TCP-LISTEN:8080 TCP:127.0.0.1:80,curl 8080 应得到 80 的结果。
+
 | 端点形式 | 语义 |
 |---------|------|
 | `TCP-LISTEN:8080` | 监听全部接口 8080 |
@@ -743,6 +819,23 @@ agent-netx socat TCP-LISTEN:8080 TCP:10.0.0.1:80 -W 5s       # 拨号超时 5s
 
 🌐 全平台。纯 TCP,server 在公网,client 在内网。轻量级 FRP 实现,server / client 两角色:
 
+#### 是什么 / 为什么测 / 与相近功能对比 / 测试要点
+
+**这是什么**:内网穿透的最简实现——公网机器起 server,内网机器起 client,访问者连 server 的端口即连到 client 的本地端口。
+
+**与主流 FRP/ngrok 对比**:
+
+| 维度 | 主流 FRP | agent-netx frp |
+|------|---------|----------------|
+| 配置 | server 和 client 各自一份 .ini | 纯 CLI flag,零配置 |
+| 协议 | TCP | TCP(简版) |
+| 鉴权 | token/密钥 | --secret 共享密钥 |
+| 插件 | 支持 | 无 |
+
+**适用场景**:临时把内网服务暴露到公网,不想配复杂 .ini。
+
+**测试要点**:两窗口分别起 server 和 client,curl server 端口应得到本机服务响应。
+
 **原理图**:
 ```
 [Client 本地服务 :8080]──► [frp client]──UDP/TCP────[frp server :7000]──► [访问者连 frp server :9090]
@@ -770,6 +863,20 @@ agent-netx frp client 8080 9090 --server 1.2.3.4:7000 --secret xxx
 
 🌐 全平台。纯 HTTP server。**场景**:浏览器跨域请求被 CSRF/预检阻断,临时绕行。
 
+#### 是什么 / 为什么测 / 与相近功能对比 / 测试要点
+
+**这是什么**:一个加 CORS 头的 HTTP 反向代理。浏览器跨域请求被预检(OPTIONS)阻断时,用它做中间人,所有响应自动加 Access-Control-Allow-Origin: *。
+
+**与 forward reverse 对比**:
+
+| 维度 | corsproxy | forward reverse |
+|------|-----------|-----------------|
+| 加 CORS 头 | ✅ 所有响应自动加 | ❌ 需要 nginx 配置 |
+| 路由规则 | 单一 dest | 可配多条 location |
+| 适用 | 浏览器调试、临时跨域 | 生产反向代理 |
+
+**测试要点**:浏览器访问 http://127.0.0.1:8080/proxy?dest=https://api.example.com/xxx,看 Response Headers 是否有 Access-Control-Allow-Origin: *。
+
 ```powershell
 agent-netx corsproxy --port 8080
 # 然后浏览器访问 http://127.0.0.1:8080/proxy?dest=https://target.example.com/...
@@ -780,6 +887,16 @@ agent-netx corsproxy --port 8080
 ### 6.7 系统代理一键开关 (sysproxy)
 
 🌐 全平台。Windows 写注册表 + netsh winhttp;Linux 走 `gsettings`(纯服务器环境 / 无桌面可能失败),同时写 `~/.proxy.env` 供无桌面环境回读。**原理图**:
+
+#### 是什么 / 为什么测 / 与相近功能对比 / 测试要点
+
+**这是什么**:把 agent-netx 的 HTTP 监听地址写入系统级代理设置(Windows 注册表+netsh winhttp,Linux gsettings+~/.proxy.env),让所有走系统代理的 App 自动走 agent-netx。
+
+**与 §6.6 对比**:§6.6 corsproxy 是把 URL 直接打到代理,响应加 CORS 头;§6.7 是让整个浏览器系统层走代理,不需要改任何 URL。
+
+**为什么单独测**:浏览器一定读系统代理。sysproxy 是"全浏览器覆盖"的开关,它不通→浏览器永远走不到 agent-netx。
+
+**测试要点**:sysproxy on 后浏览器走 7890;sysproxy off 后恢复直连。
 ```
 [浏览器 / App]──系统代理设置──► [agent-netx HTTP 监听 :7890]──► 上游代理 / 直连
          ▲                                   │
@@ -809,6 +926,24 @@ agent-netx sysproxy status
 ### 6.8 ping(hping3 风格)
 
 🌐 全平台。⚠️ `-1`(ICMP) / `--flood` / `--traceroute` 需 Administrator 或 root(raw socket);`-S` TCP / `-2` UDP 模式无权限要求。
+
+#### 是什么 / 为什么测 / 与相近功能对比 / 测试要点
+
+**这是什么**:hping3 的简化版实现,支持 ICMP/TCP SYN/UDP 三种探测模式+traceroute。
+
+**与系统 ping 对比**:
+
+| 模式 | 系统 ping | agent-netx ping |
+|------|----------|-----------------|
+| ICMP | ✅ | ✅(-1/--icmp,需管理员) |
+| TCP SYN | ❌ | ✅(-S,无需权限) |
+| UDP probe | ❌ | ✅(-2,无需权限) |
+| flood | 需 mtr | ✅(--flood,需管理员) |
+| traceroute | 需 traceroute | ✅(--traceroute) |
+
+**为什么测 TCP/UDP 优先**:本机可能没管理员权限,ICMP 会失败;TCP/UDP 无权限要求,先测它们。
+
+**测试要点**:ping -S 8.8.8.8 -p 443 -c 2;ping -2 8.8.8.8 -p 53 -c 2;有管理员再测 -1。
 
 **不需要配置文件**。三种模式 + traceroute,与 hping3 对齐:
 
@@ -848,6 +983,26 @@ agent-netx netdiag <conns|listeners|packets|stats|interfaces|routes|proto|fd>
 ```
 
 🌐 全平台。⚠️ `packets` 子命令需 Administrator 或 root(`CAP_NET_RAW`);其余子命令无权限要求。
+
+#### 是什么 / 为什么测 / 与相近功能对比 / 测试要点
+
+**这是什么**:netstat/ss/tcpdump 的 Go 实现。读内核态网络状态,输出格式与系统命令对齐。
+
+**与系统命令对应关系**:
+
+| 子命令 | 等价 | 适用场景 |
+|--------|------|---------|
+| conns | netstat -an / ss -tuan | 看所有连接、按状态分组 |
+| listeners | ss -tlnp | 看哪些端口在监听 |
+| packets | tcpdump | 抓包(需管理员) |
+| stats | ss -s | 聚合统计 |
+| interfaces | ip -s link | 网卡 IO 统计 |
+| routes | netstat -r | 路由表 |
+| fd | lsof -p | 看进程文件句柄 |
+
+**为什么零依赖**:全部走 gopsutil v3/net 读内核态数据,零 cgo,可交叉编译。
+
+**测试要点**:netdiag conns→看到 ESTABLISHED;netdiag listeners→看到 7890;有管理员再测 packets。
 
 **原理图**:
 ```
@@ -891,6 +1046,22 @@ agent-netx netdiag fd --pid 1234
 
 🌐 全平台。依赖 SSH 可达,零系统依赖。
 
+#### 是什么 / 为什么测 / 与相近功能对比 / 测试要点
+
+**这是什么**:通过 SSH session 上传/下载文件。复用 agent 的 SSH 凭据记忆——首次 --host/--user/--password,后续 --alias 免输。
+
+**与系统 scp 对比**:
+
+| 维度 | 系统 scp | agent-netx scp |
+|------|---------|----------------|
+| 凭据记忆 | 需 SSH key | 支持密码+别名,自动写入 memory.json |
+| 缺失字段 | 终端询问 | 同上,且一次记忆 |
+| 复用 TUI | 无 | TUI 的 file_copy 用同一套代码 |
+
+**为什么测它**:后续 §7.9 一键部署依赖 scp 传二进制,它不通→远端部署全部失效。
+
+**测试要点**:上传一个小文件到远程,再下载回来,对比内容。
+
 复用 agent 的 SSH 凭据记忆,HIL 交互询问缺失信息:
 
 ```powershell
@@ -904,6 +1075,20 @@ agent-netx scp --action upload --host 10.0.0.5 --user root --src f.bin --dst /tm
 ### 6.11 执行命令 (run)
 
 🌐 全平台。`local` 走 `cmd.exe /c`(Windows)或 `/bin/sh -c`(Linux/macOS);`remote` 依赖 SSH 可达。
+
+#### 是什么 / 为什么测 / 与相近功能对比 / 测试要点
+
+**这是什么**:本地或远端执行一条 shell。local 走 cmd.exe /c 或 /bin/sh -c;remote 走 SSH。
+
+**与 ssh 对比**:
+
+| 维度 | ssh | agent-netx run remote |
+|------|-----|----------------------|
+| 凭据 | 需 SSH key/交互 | 密码+别名记忆,自动写入 memory.json |
+| 缺失字段 | 终端询问 | 同上 |
+| TUI 集成 | 无 | TUI 自然语言直接触发 |
+
+**测试要点**:run local --cmd "whoami"→返回当前用户名;有远程机再测 remote。
 
 本地 / 远端执行一条 shell:
 
@@ -927,6 +1112,14 @@ agent-netx run remote --host 10.0.0.5 --user root --password xxx --cmd "whoami"
 
 🌐 全平台。基于 PID 文件,跨进程停/起子服务。
 
+#### 是什么 / 为什么测 / 与相近功能对比 / 测试要点
+
+**这是什么**:跨进程的日志查看和子服务启停。每个子服务启动时写 PID 文件,stop/restart 按 PID 文件发信号,logs 读共享日志文件。
+
+**为什么测它**:它是所有子服务的控制面板,它不通→出问题没法停、没法看日志。
+
+**测试要点**:起一个子服务→logs --tail 20 看到日志→stop 停掉→restart 重新起来。
+
 ```powershell
 agent-netx logs [--tail 100] [--follow]    # 读共享日志文件,--follow 类似 tail -f
 agent-netx stop <name|all>                  # 通过 PID 文件跨进程停子服务
@@ -938,6 +1131,23 @@ agent-netx restart <name|all>               # 停 + 起
 ### 6.13 LLM Agent + TUI
 
 🌐 全平台。Windows 用 `mwindows` + `syscall`(伪控制台);Linux/macOS 用 `termios`。底层终端适配由 build tag 区分,命令集完全一致。
+
+#### 是什么 / 为什么测 / 与相近功能对比 / 测试要点
+
+**这是什么**:通过自然语言驱动所有 agent-netx 功能。TUI 是终端交互界面,Agent 是 LLM 调用层,两者配合:你在 TUI 里写人话,Agent 翻译成工具调用。
+
+**与纯 CLI 对比**:
+
+| 维度 | 纯 CLI | TUI + Agent |
+|------|--------|-------------|
+| 输入 | 精确命令和参数 | 自然语言 |
+| 学习成本 | 高(记 22+ 命令) | 低(会打字就行) |
+| 状态保持 | 每次重连重输 | 会话可 --continue 续写 |
+| 记忆 | 无 | remember 工具存 SSH 凭据/别名 |
+
+**22+ 工具分 5 类**:配置管理(get_config/update_config/gen_config/add_proxy/add_rule/init)、代理操作(ping_proxies/switch_group/sysproxy)、网络诊断(net_connections/net_listeners/net_ping/net_packets)、文件/命令(file_copy/run_local/run_remote)、会话管理(session_list/session_load/session_save)。
+
+**测试要点**:配好 agent.yml→tui 启动→输入"查看当前配置"→应调用 get_config→输入"添加代理 test http 1.2.3.4:443 用户名 u 密码 p"→应写入 dynamic.yml。
 
 ```powershell
 agent-netx tui                            # 新会话
@@ -983,6 +1193,14 @@ agent-netx tui --agent-config agent.yml   # 指定 agent 配置
 
 🌐 全平台。运行时生效无需重启。
 
+#### 是什么 / 为什么测 / 与相近功能对比 / 测试要点
+
+**这是什么**:一个运行时覆盖层文件,add_proxy/add_rule 工具写进去,主进程无需重启就能读到新增的代理和规则。
+
+**为什么需要它**:改主 config.yml 要重启,动态覆盖层避免了重启;同名代理以主 config 为准,冲突可控。
+
+**测试要点**:TUI 里 add_rule 一条规则→curl 访问匹配该规则的域名→看日志是否走了新规则。
+
 `add_proxy` / `add_rule` 工具写到的覆盖层文件是 `~/.agent-netx/dynamic.yml`,结构:
 
 ```yaml
@@ -1006,6 +1224,21 @@ rules:
 ### 7.1 全局代理
 
 🌐 全平台。
+
+#### 是什么 / 为什么测 / 与相近功能对比 / 测试要点
+
+**这是什么**:想让整个机器都走一个 SS/Trojan/VLESS 出去,是最经典的"翻墙"场景。§7.1 是业务级——除了浏览器,任何直连的 App(游戏、下载工具、命令行)都需要在 app 里手动配 HTTP/SOCKS5 代理地址。§6.7 sysproxy 是系统级开关,让浏览器等走系统代理设置的 App 自动用。
+
+**与 §7.8 TUN 对比**:
+
+| 维度 | 全局代理(§7.1) | TUN(§7.8) |
+|------|----------------|-----------|
+| 生效范围 | 只影响显式配置代理的 App | 影响整个系统的 IP 层 |
+| 配置难度 | 每个 App 单独配 | 一次配好,所有 App 无感 |
+| 穿透能力 | 只 TCP/UDP | TCP/UDP+非 HTTP 协议 |
+| 依赖 | 无 | 管理员(wintun / /dev/net/tun) |
+
+**测试要点**:配 SS proxy→mode: global→start→sysproxy on→浏览器打开外网→应走 SS。
 
 **应用场景**:想让整个机器都走一个 SS/Trojan/VLESS 出去。
 
@@ -1036,6 +1269,22 @@ proxies:
 
 🌐 全平台。WinDivert / Linux TProxy 方案(方案 B)分别见 §7.6 / §7.7 的平台约束。
 
+#### 是什么 / 为什么测 / 与相近功能对比 / 测试要点
+
+**这是什么**:普通代理是"客户端主动连接",MITM 是"服务端伪造证书+客户端以为在和真服务器对话"。中间人(就是 agent-netx)拿到明文内容,可以做内容检查/篡改/记录。
+
+**与 §6.3 forward tls 对比**:
+
+| 维度 | forward tls | MITM |
+|------|-------------|------|
+| 证书 | 无,只做 TLS 终止 | 有,按 allowlist 签发 per-host 证书 |
+| 白名单 | 无 | 有,只有白名单命中的 host 才解密 |
+| 内容检查 | 无 | 有,可读取/修改 HTTP 内容 |
+
+**安全红线**:默认 enable: false;allowlist 为空时即使 enable=true 也不拦截。
+
+**测试要点**:allowlist 加 DOMAIN,example.com→装 CA→浏览器访问 https://example.com 应被解密→访问 github.com 应走普通 TLS。
+
 **应用场景**:某 App 写死域名、不读系统代理,又想透明加密转发或做内容检查。
 
 **原理图**:
@@ -1062,6 +1311,21 @@ proxies:
 ### 7.3 多代理自动选最快 + 故障切换
 
 🌐 全平台。
+
+#### 是什么 / 为什么测 / 与相近功能对比 / 测试要点
+
+**这是什么**:rules 只决定"流量走哪个分组",分组决定"分组里走哪个代理"。url-test 每 5 分钟测速选最快,failover 按序尝试首个失败切下条。
+
+**与单一代理对比**:
+
+| 维度 | 单一代理 | url-test 分组 | failover 分组 |
+|------|---------|--------------|--------------|
+| 代理数 | 1 | ≥2 | ≥2 |
+| 选路策略 | 固定 | 按测速选最快 | 按序失败切换 |
+| 故障切换 | 无 | 下一个测速周期 | 即时 |
+| 适用 | 单线 | 双线抢跑 | 主备切换 |
+
+**测试要点**:配两个 SS 代理(一个可用一个不可用)→url-test 分组应自动选可用→停掉可用的→等测速周期(300s)应切到另一个。
 
 **应用场景**:有两条代理线路,想自动选最快,挂了自动切换。
 
@@ -1115,6 +1379,22 @@ rules:
 
 🌐 全平台。
 
+#### 是什么 / 为什么测 / 与相近功能对比 / 测试要点
+
+**这是什么**:TLS 握手的 ClientHello 消息里有一堆参数,每个浏览器都有独特组合,这就是 JA3 指纹。Go 标准库的指纹是"Go 标准库",网络方直接封;uTLS 库能伪造 Chrome/Firefox 的指纹。
+
+**与 VMESS 对比**:
+
+| 维度 | VMESS | VLESS | VLESS + Reality |
+|------|-------|-------|-----------------|
+| 加密 | AEAD 加密 payload | 无(走 TLS) | 无 |
+| 伪装 | 无 | 无 | Reality(X25519 认证) |
+| 指纹 | 有(VMess 握手特征) | 有(uTLS 伪造) | 有(uTLS 伪造) |
+| 兼容 | Clash/V2Ray | V2Ray | V2Ray |
+| 适用 | 普通代理 | 指纹封锁场景 | 指纹封锁+主动探测 |
+
+**测试要点**:拿上游 uuid/public-key/short-id/server:port/sni→配 type: vless + fingerprint: chrome→浏览器走代理应能访问外网。
+
 **应用场景**:被网络方以 JA3 指纹 + SNI 联合封锁,需要伪装成真实浏览器。
 
 **原理图**:
@@ -1140,6 +1420,22 @@ rules:
 ### 7.5 跨 NAT 组网:n2n 虚拟局域网
 
 🌐 全平台。
+
+#### 是什么 / 为什么测 / 与相近功能对比 / 测试要点
+
+**这是什么**:N2N 是"虚拟局域网",所有节点看起来像在同一个网段。节点发现、IP 分配、NAT 打洞都需要一个公网中心节点(Supernode)协调。打洞成功后节点 P2P 直连,失败则经 Supernode 中继。
+
+**与 WireGuard 对比**:
+
+| 维度 | n2n | WireGuard |
+|------|-----|-----------|
+| 打洞 | 有(Supernode 协调) | 需打洞工具(如 wgcf) |
+| IP 分配 | Supernode 自动分配 | 手动配 |
+| 配置 | YAML(简单) | 公钥/私钥+peer 配置 |
+| 打洞成功率 | 较高(Supernode 中转) | 低(纯 P2P) |
+| 性能 | P2P 时高,中继时低 | 一直高(P2P) |
+
+**测试要点**:公网机器起 Supernode→本地起 Edge→两台 Edge ping 对方虚拟 IP(10.200.0.x)→加 tun.enable 后任意 App 无感互通。
 
 **应用场景**:家里/办公室几台机器想互通内网、团队临时内网。
 
@@ -1185,6 +1481,22 @@ rules:
 ### 7.6 Windows 透明代理 (WinDivert TProxy)
 
 🪟 ⚠️ Windows 专属。需 Administrator + WinDivert64.sys 驱动(首次 open 时 godivert 自动安装)。`mark/table` 为 no-op。
+
+#### 是什么 / 为什么测 / 与相近功能对比 / 测试要点
+
+**这是什么**:Windows 没有 iptables TPROXY/IP_TRANSPARENT/IP_ORIGDSTADDR 这套内核能力。把转发包投递到本地 socket 并保留原始目的地址,在 Windows 上没有内核级实现。WinDivert 在用户态用 Win32 驱动做包改写。
+
+**与 Linux TProxy(§7.7)对比**:
+
+| 维度 | Windows(WinDivert) | Linux(iptables TPROXY) |
+|------|-------------------|----------------------|
+| 内核机制 | 用户态驱动 | netfilter 内核 |
+| 权限 | Administrator | root |
+| 驱动 | WinDivert64.sys(自动安装) | 无,内核自带 |
+| 协议 | IPv4 only | IPv4+IPv6 |
+| mark/table | no-op | 有效(fwmark 路由环) |
+
+**测试要点**:本机设为 LAN 客户端的默认网关→Administrator 身份启动→LAN 客户端访问白名单域名→应触发 MITM 解密。
 
 **应用场景**:局域网出口部署 HTTPS 内容检查;让客户端不感知地走代理。
 
@@ -1238,6 +1550,22 @@ rules:
 
 🐧 Linux 专属。需 root + iptables TPROXY 规则(需用户自建,与监听端口/协议相关)。
 
+#### 是什么 / 为什么测 / 与相近功能对比 / 测试要点
+
+**这是什么**:在 Linux 网关上对局域网做透明代理+MITM。Linux 的透明代理能力比 Windows 强得多,因为内核级 netfilter 天然支持。
+
+**与 Windows TProxy(§7.6)对比**:
+
+| 维度 | Windows(WinDivert) | Linux(iptables TPROXY) |
+|------|-------------------|----------------------|
+| 内核机制 | 用户态驱动 | netfilter 内核 |
+| 权限 | Administrator | root |
+| 协议 | IPv4 only | IPv4+IPv6 |
+| 配置复杂度 | 简单(自动装驱动) | 中(需配 iptables+ip rule) |
+| mark/table | no-op | 有效 |
+
+**测试要点**:本机设为 LAN 网关→配 iptables TPROXY 规则→LAN 客户端访问→应被转发到 tproxy 监听。
+
 **应用场景**:在 Linux 网关上对局域网做透明代理 + MITM。
 
 **原理图**:
@@ -1267,6 +1595,21 @@ ip route local table 100                       接受 IP_ORIGDSTADDR=原始目�
 
 🌐 全平台。TUN 设备:Windows 用 `wintun`(`wintun.dll` 放程序目录),Linux/macOS 用 `/dev/net/tun`。
 
+#### 是什么 / 为什么测 / 与相近功能对比 / 测试要点
+
+**这是什么**:TUN 是网络层的虚拟网卡,所有走这张网卡的流量都被 agent-netx 接管。agent-netx 支持 n2n/STUN/TURN/WireGuard 三种隧道协议。TUN 是它们的统一出口。
+
+**与 §7.1 全局代理对比**:
+
+| 维度 | 全局代理 | TUN |
+|------|---------|-----|
+| 生效层 | 应用层(HTTP/SOCKS5) | 网络层(IP) |
+| 生效范围 | 显式配代理的 App | 整个系统(或路由指向的流量) |
+| 穿透能力 | 只 TCP/UDP | TCP/UDP+非 HTTP 协议 |
+| 依赖 | 无 | 管理员+wintun.dll(/dev/net/tun) |
+
+**测试要点**:Windows 放 wintun.dll,Linux/macOS 确认 /dev/net/tun 存在→tun.enable: true + 任意隧道→启动→应看到新虚拟网卡→ping 对端虚拟 IP→应通。
+
 **应用场景**:让"任意 App 无感走代理"或"任意 App 无感访问内网对端",无需改 App 代理设置。
 
 **原理图**:
@@ -1292,6 +1635,21 @@ ip route local table 100                       接受 IP_ORIGDSTADDR=原始目�
 ### 7.9 一键部署(在远端服务器上起 n2n/frp/wireguard)
 
 🌐 全平台。依赖 SSH 可达。
+
+#### 是什么 / 为什么测 / 与相近功能对比 / 测试要点
+
+**这是什么**:有一台公网服务器,想在上面起 n2n 中心节点或 frp 服务端,用自然语言搞定。适合"不想开 SSH 客户端手动配"的场景。
+
+**与手动 SSH 部署对比**:
+
+| 维度 | 手动 SSH | TUI 一键部署 |
+|------|---------|-------------|
+| 步骤数 | 5+ | 1(自然语言) |
+| 凭据管理 | 需 SSH key 或交互 | 自动 memory.json |
+| 配置文件 | 手写 | gen_config 自动生成 |
+| 二进制传输 | scp 手动 | file_copy 自动 |
+
+**测试要点**:记得远端 SSH 凭据(TUI 用 remember 工具或 --alias)→输入"在远端起 n2n supernode"→应自动 gen_config+file_copy+run_remote→本机 Edge 连 Supernode→应能 ping 通。
 
 **应用场景**:有一台公网服务器,想在上面起 n2n 中心节点或 frp 服务端,用自然语言搞定。
 
@@ -1322,6 +1680,12 @@ agent-netx run remote --alias prod --cmd "cd /opt/agent-netx && ./agent-netx sta
 ### 7.10 场景速查
 
 🌐 各场景平台约束见对应小节开头标注。
+
+#### 是什么 / 为什么测 / 与相近功能对比 / 测试要点
+
+**这是什么**:所有 §7.x 场景的入口索引表。不用翻遍整个手册,根据"想干嘛"直接跳到对应小节。
+
+**使用方式**:左列是用户意图,右列是手册章节号。先在本表找到意图,再跳目标小节看详细步骤。
 
 | 想干嘛 | 用哪个 |
 |-------|------|
