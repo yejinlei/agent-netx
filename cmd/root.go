@@ -308,9 +308,6 @@ func fullStart(cmd *cobra.Command) error {
 	if cfg.TUN.Enable {
 		start("tun", func() error { return runTUN(ctx, cfg, logRing) })
 	}
-	if cfg.MITM.Enable {
-		start("mitm", func() error { return runMITM(ctx, cfg, logRing) })
-	}
 	if cfg.N2N.Enable {
 		start("n2n", func() error { return runN2N(ctx, cfg, logRing, true) })
 	}
@@ -652,6 +649,7 @@ func tuiCmd() *cobra.Command {
 				BaseURL:         ca.BaseURL,
 				APIKey:          ca.APIKey,
 				Model:           ca.Model,
+				Models:          ca.Models,
 				SystemPrompt:    sysPrompt,
 				Mode:            agent.ParseAgentMode(ca.Mode),
 				ConfigPath:      cfgPath,

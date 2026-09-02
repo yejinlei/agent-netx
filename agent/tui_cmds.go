@@ -102,7 +102,7 @@ func init() {
 // already stripped of the leading slash and whitespace.
 func (t *tui) completeSlash(text string) []string {
 	candidates := []string{
-		"help", "sessions", "session", "new", "rename", "delete", "clear",
+		"help", "sessions", "session", "new", "rename", "delete", "clear", "model",
 		"init", "status", "ping", "use", "sysproxy",
 		"start", "proxy", "dns", "web", "tun", "n2n", "stunvpv", "wireguard",
 		"frp", "tinc", "socat", "corsproxy", "forward", "scp",

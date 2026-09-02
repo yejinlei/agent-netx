@@ -105,6 +105,7 @@ func runProxy(ctx context.Context, cfg *config.Config, logRing *web.LogRing, sta
 		TProxyMark:  cfg.Listen.TProxyMark,
 		TProxyTable: cfg.Listen.TProxyTable,
 		Router:      rtr,
+		MITM:        buildMITMHandler(cfg, logRing),
 		Stats:       stats,
 	})
 	if err != nil {
@@ -255,9 +256,20 @@ func runSTUNVPV(ctx context.Context, cfg *config.Config, logRing *web.LogRing, u
 	}
 }
 
-// runMITM sets up HTTPS interception. Currently loads/ensures the CA and
-// returns; a full intercepting listener is a pending task.
-func runMITM(ctx context.Context, cfg *config.Config, logRing *web.LogRing) error {
+// buildMITMHandler builds a listener.MITMHandler when MITM is enabled with
+// a non-empty allowlist. Empty allowlist disables interception even with
+// enable=true (安全红线: default-deny). Returns nil when MITM is off or
+// the CA cannot be loaded/generated (logs a warning in that case).
+func buildMITMHandler(cfg *config.Config, logRing *web.LogRing) *listener.MITMHandler {
+	if !cfg.MITM.Enable {
+		return nil
+	}
+	if len(cfg.MITM.Allowlist) == 0 {
+		if logRing != nil {
+			logRing.Write(web.WARN, "mitm: enabled but allowlist is empty — interception disabled (安全红线)")
+		}
+		return nil
+	}
 	caCert, err := mitm.LoadCA(cfg.MITM.CAPath+".crt", cfg.MITM.CAPath+".key")
 	if err != nil {
 		if logRing != nil {
@@ -265,16 +277,29 @@ func runMITM(ctx context.Context, cfg *config.Config, logRing *web.LogRing) erro
 		}
 		caCert, err = mitm.GenerateCA("net-redirect")
 		if err != nil {
-			return fmt.Errorf("generate ca: %w", err)
+			if logRing != nil {
+				logRing.Write(web.ERROR, "mitm: generate CA: %v", err)
+			}
+			return nil
 		}
 		if err := caCert.SaveTo(cfg.MITM.CAPath); err != nil {
-			return fmt.Errorf("save ca: %w", err)
+			if logRing != nil {
+				logRing.Write(web.ERROR, "mitm: save CA: %v", err)
+			}
+			return nil
 		}
 	}
-	_ = mitm.NewInterceptor(caCert, cfg.MITM.CertDir)
 	if logRing != nil {
-		logRing.Write(web.INFO, "mitm: HTTPS interception ready on :%d", cfg.MITM.HTTPPort)
+		logRing.Write(web.INFO, "mitm: HTTPS interception ready (allowlist=%d rules)", len(cfg.MITM.Allowlist))
 	}
-	<-ctx.Done()
-	return nil
+	return &listener.MITMHandler{
+		Interceptor:    mitm.NewInterceptor(caCert, cfg.MITM.CertDir),
+		Allowlist:      cfg.MITM.Allowlist,
+		SkipHosts:      cfg.MITM.SkipHosts,
+		VerifyUpstream: cfg.MITM.VerifyUpstream,
+		EgressProxy:    nil,
+	}
 }
+
+// (MITM interception used to run as a standalone subsystem here; it now lives
+// inside runProxy via buildMITMHandler, which is the canonical init path.)

@@ -27,6 +27,10 @@ type Options struct {
 	TProxyMark  int
 	TProxyTable int
 	Router      *router.Router
+	// MITM, when non-nil, enables HTTPS interception for CONNECT requests
+	// whose target matches the MITM allowlist (see listener/mitm.go). nil
+	// disables interception entirely; empty allowlist disables too (安全红线).
+	MITM *MITMHandler
 	// Stats optionally receives per-proxy traffic + connection accounting.
 	// nil disables accounting (no overhead).
 	Stats *web.StatsTracker
@@ -209,6 +213,26 @@ func (l *Listener) handleHTTP(conn net.Conn) {
 		log.Printf("pick proxy for %s: %v", target, err)
 		return
 	}
+
+	// MITM HTTPS interception: only for allowlist-matched hosts (see mitm.go).
+	// When intercepting, we TLS-terminate the client side, read the first
+	// plaintext request, re-establish TLS to the real origin, and relay the
+	// decrypted streams. SkipHosts is a safety valve for CONNECT tunnels that
+	// carry non-HTTP protocols over 443.
+	if l.opts.MITM != nil && l.opts.MITM.ShouldIntercept(target) && !l.opts.MITM.SkipHost(target) {
+		tlsClient, upstream, firstReq, err := l.opts.MITM.InterceptConnect(conn, target)
+		if err != nil {
+			log.Printf("mitm intercept %s: %v — falling back to tunnel", target, err)
+		} else {
+			defer upstream.Close()
+			if firstReq != nil {
+				upstream.Write(firstReq)
+			}
+			l.relay(tlsClient, upstream, proxy.Name())
+			return
+		}
+	}
+
 	remote, err := proxy.Connect(context.Background(), target)
 	if err != nil {
 		log.Printf("proxy connect %s via %s: %v", target, proxy.Name(), err)
@@ -569,6 +593,25 @@ func (l *Listener) handleTProxy(conn net.Conn) {
 	client := clientAddrStr(conn)
 	if client != "" {
 		log.Printf("tproxy: %s -> %s", client, target)
+	}
+
+	// MITM over TProxy: transparent connections have no CONNECT hostname —
+	// the original destination is an IP:port — so the allowlist matches by
+	// IP-CIDR rules. When it hits, TLS-terminate here (the signed cert will
+	// carry the IP SAN; clients must trust our CA anyway for interception to
+	// work at all), re-encrypt upstream, and relay decrypted.
+	if l.opts.MITM != nil && l.opts.MITM.ShouldInterceptIP(ta.IP.String()) && !l.opts.MITM.SkipHost(target) {
+		tlsClient, upstream, firstReq, err := l.opts.MITM.InterceptConnect(conn, target)
+		if err != nil {
+			log.Printf("tproxy mitm intercept %s: %v — falling back to tunnel", target, err)
+		} else {
+			defer upstream.Close()
+			if firstReq != nil {
+				upstream.Write(firstReq)
+			}
+			l.relay(tlsClient, upstream, "TPROXY-MITM")
+			return
+		}
 	}
 
 	p, err := l.opts.Router.Pick(target)

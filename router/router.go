@@ -231,3 +231,60 @@ func geoipMatch(host string) bool {
 	return false
 }
 
+// MatchAllow checks whether host matches any rule in allowlist.
+// Each raw rule has the same syntax as Router rules: "TYPE,pattern[,target]".
+// Only the first two segments are used (target is ignored). Supported types:
+// DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD / REGEX / IP-CIDR / MATCH.
+// Returns true on first match; false if allowlist is empty or no rule matches.
+func MatchAllow(host string, allowlist []string) bool {
+	for _, raw := range allowlist {
+		parts := strings.SplitN(raw, ",", 3)
+		if len(parts) < 2 {
+			continue
+		}
+		rule := Rule{
+			Type:    strings.ToUpper(strings.TrimSpace(parts[0])),
+			Pattern: strings.TrimSpace(parts[1]),
+		}
+		if rule.Type == "REGEX" {
+			re, err := regexp.Compile(rule.Pattern)
+			if err != nil {
+				continue
+			}
+			rule.regex = re
+		}
+		if matchAllow(host, rule) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchAllow mirrors Router.match for the MITM allowlist path. It only has
+// host (no port context), so PORT-RANGE is unsupported and GEOIP falls through.
+func matchAllow(host string, rule Rule) bool {
+	switch rule.Type {
+	case "DOMAIN":
+		return host == rule.Pattern
+	case "DOMAIN-SUFFIX":
+		suffix := rule.Pattern
+		if !strings.HasPrefix(suffix, ".") {
+			suffix = "." + suffix
+		}
+		return strings.HasSuffix(host, suffix) || host == strings.TrimPrefix(rule.Pattern, ".")
+	case "DOMAIN-KEYWORD":
+		return strings.Contains(host, rule.Pattern)
+	case "REGEX":
+		if rule.regex != nil {
+			return rule.regex.MatchString(host)
+		}
+		return false
+	case "IP-CIDR":
+		return inCIDR(host, rule.Pattern)
+	case "MATCH":
+		return true
+	default:
+		return false
+	}
+}
+

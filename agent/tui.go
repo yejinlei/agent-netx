@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -114,6 +115,10 @@ type tui struct {
 	inputBuf         []byte
 	modeIdx          int
 	modeFlash        time.Time
+	models           []string // Shift+Tab 模型候选（primary 恒在首位）
+	modelIdx         int      // models 中当前模型的下标
+	modelFlash       time.Time
+	approveAll       bool // 确认框按 'a' 后本会话不再询问
 	hideTasks        bool
 }
 
@@ -148,6 +153,26 @@ func newTUI(ctx context.Context, cfg Config) *tui {
 	session.Messages = append(session.Messages, Message{Role: RoleSystem, Content: systemMsg})
 	_ = store.Save(session)
 
+	// Shift+Tab model candidates: primary Model always first, then cfg.Models
+	// deduped against it. modelIdx points at the current model.
+	models := []string{cfg.Model}
+	for _, m := range cfg.Models {
+		m = strings.TrimSpace(m)
+		if m == "" || m == cfg.Model {
+			continue
+		}
+		dup := false
+		for _, have := range models[1:] {
+			if have == m {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			models = append(models, m)
+		}
+	}
+
 	return &tui{
 		cfg:      cfg,
 		ctx:      ctx,
@@ -157,6 +182,8 @@ func newTUI(ctx context.Context, cfg Config) *tui {
 		session:  session,
 		store:    store,
 		msgs:     session.Messages,
+		models:   models,
+		modelIdx: 0,
 	}
 }
 
@@ -274,7 +301,16 @@ func (t *tui) showAllCommands() {
 	fmt.Println("  " + sStatusKey.Render("/rename <name>") + "    重命名当前会话")
 	fmt.Println("  " + sStatusKey.Render("/delete <name/id>") + "  删除某个会话")
 	fmt.Println("  " + sStatusKey.Render("/clear") + "           清空当前会话(保留元数据)")
-	fmt.Println("  " + sStatusKey.Render("Tab / Shift+Tab") + "  切换 AI 模式 (auto / manual / plan / edit)")
+	fmt.Println("  " + sStatusKey.Render("/model [name]") + "     列出/切换 AI 模型")
+	fmt.Println()
+	fmt.Println(sThinking.Render("✻ ") + sSubtitle.Render("快捷键 (仿 Claude Code)"))
+	fmt.Println()
+	fmt.Println("  " + sStatusKey.Render("Tab") + "              切换 AI 模式 (auto / manual / plan / edit)")
+	fmt.Println("  " + sStatusKey.Render("Shift+Tab") + "        切换 AI 模型（最高优先级）")
+	fmt.Println("  " + sStatusKey.Render("ESC") + "              中断 AI 思考；清空输入框")
+	fmt.Println("  " + sStatusKey.Render("↑ / ↓") + "            翻阅历史输入（AI 思考中按 ↑ 可暂存未发送消息）")
+	fmt.Println("  " + sStatusKey.Render("确认框 a") + "         本会话全部允许，不再逐个询问")
+	fmt.Println("  " + sStatusKey.Render("Ctrl+C / Ctrl+D") + "  中断 / 退出")
 	fmt.Println()
 	fmt.Println(sThinking.Render("✻ ") + sSubtitle.Render("CLI 快捷命令 (映射到 agent-netx 子命令)"))
 	fmt.Println()
@@ -413,6 +449,37 @@ func (t *tui) handleCommand(line string) bool {
 		t.renderAILine("当前会话已清空")
 		return true
 
+	case "/model":
+		if arg == "" {
+			fmt.Println()
+			fmt.Println(sThinking.Render("✻ ") + sSubtitle.Render("AI 模型 (Shift+Tab 循环切换)"))
+			for i, m := range t.models {
+				mark := "  "
+				if m == t.cfg.Model {
+					mark = "▸ "
+				}
+				line := "  " + mark + sStatusKey.Render(m)
+				if i == 0 {
+					line += sStatusVal.Render("  (primary)")
+				}
+				fmt.Println(line)
+			}
+			fmt.Println(sStatusVal.Render("  用法: /model <name>"))
+			fmt.Println()
+			return true
+		}
+		if !slices.Contains(t.models, arg) {
+			t.renderAILine("未知模型: " + arg + "（/model 查看候选）")
+			return true
+		}
+		t.setModel(arg)
+		t.modelFlash = time.Now().Add(2 * time.Second)
+		t.renderHeader()
+		t.renderStatusBar()
+		flushStdout()
+		t.renderAILine("已切换模型: " + arg)
+		return true
+
 	case "/add-proxy":
 		t.addProxyCmd(arg)
 		return true
@@ -531,6 +598,12 @@ func (t *tui) run(ctx context.Context) error {
 		if t.pendingAnswer != "" {
 			line = t.pendingAnswer
 			t.pendingAnswer = ""
+		} else if t.interruptedInput != "" {
+			// ESC/Ctrl-C 中断时用户已排队的输入：不自动重发（那是 AI 正在
+			// 被打断的内容），而是预填进输入框等用户确认再按 Enter。
+			t.renderPrompt(t.interruptedInput)
+			t.interruptedInput = ""
+			continue
 		} else {
 			line, err = t.readLine(rawMode)
 		}
@@ -556,8 +629,7 @@ func (t *tui) run(ctx context.Context) error {
 			if t.handleCommand(line) {
 				t.history = append(t.history, line)
 				t.histIdx = len(t.history)
-				t.renderStatusBar()
-				flushStdout()
+				t.focusInput()
 				continue
 			}
 		}
@@ -618,7 +690,8 @@ func (t *tui) run(ctx context.Context) error {
 				}
 
 				// 手动模式：全部工具需确认；编辑模式：仅执行类工具需确认。
-				needConfirm := mode == modeManual || (mode == modeEdit && isExecTool(tc.Function.Name))
+				// approveAll（确认框按 'a'）后本会话不再询问 —— 「过于频繁」。
+				needConfirm := (mode == modeManual || (mode == modeEdit && isExecTool(tc.Function.Name))) && !t.approveAll
 				if needConfirm && !t.confirmTool(tc.Function.Name, argsStr) {
 					if !t.hideTasks {
 						msg := fmt.Sprintf("(用户未批准执行工具 %s)", tc.Function.Name)
@@ -660,7 +733,7 @@ func (t *tui) run(ctx context.Context) error {
 		}
 		t.saveCurrentSession()
 		t.renderPrompt("")
-		t.renderStatusBar()
+		t.focusInput() // 回复结束：焦点+可见光标交还输入框
 	}
 }
 
@@ -693,6 +766,50 @@ func (t *tui) cycleMode(dir int) {
 	flushStdout()
 }
 
+// setModel 把当前模型切到 name（同步 cfg / llm / session 三处副本）。
+// LLM 每次 Complete 都从 l.cfg.Model 现取，所以无需重建任何对象。
+func (t *tui) setModel(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i, m := range t.models {
+		if m == name {
+			t.modelIdx = i
+			break
+		}
+	}
+	if t.cfg.Model == name {
+		return true
+	}
+	t.cfg.Model = name
+	t.llm.cfg.Model = name
+	if t.session != nil {
+		t.session.Model = name
+	}
+	return true
+}
+
+// cycleModel 按 dir 循环 Shift+Tab 模型候选，切换后头部与状态条短暂高亮。
+func (t *tui) cycleModel(dir int) {
+	n := len(t.models)
+	if n == 0 {
+		return
+	}
+	if n == 1 {
+		t.modelFlash = time.Now().Add(2 * time.Second)
+		t.renderHeader()
+		t.renderStatusBar()
+		flushStdout()
+		return
+	}
+	t.modelIdx = (t.modelIdx + dir + n) % n
+	t.setModel(t.models[t.modelIdx])
+	t.modelFlash = time.Now().Add(2 * time.Second)
+	t.renderHeader()
+	t.renderStatusBar()
+	flushStdout()
+}
+
 // promptStr 是输入行的样式前缀：当前模式标签 + ❯。
 func (t *tui) promptStr() string {
 	return sPrompt.Render("> ")
@@ -715,7 +832,7 @@ func (t *tui) confirmTool(name, args string) bool {
 	// 确认提示锚定到滚动区最后一行(输入框上方)，避免从任意光标位置打印造成错位。
 	fmt.Printf("\033[%d;1H", termHeight-4)
 	flushStdout()
-	fmt.Print(sThinking.Render("✻ ") + fmt.Sprintf("允许执行 [%s] %s？(Enter=执行 / n=跳过) ", name, args))
+	fmt.Print(sThinking.Render("✻ ") + fmt.Sprintf("允许执行 [%s] %s？(Enter=执行 / a=本会话全部允许 / n=跳过) ", name, args))
 	buf := make([]byte, 0, 8)
 	for {
 		r, err := readUtf8Rune(os.Stdin)
@@ -725,13 +842,19 @@ func (t *tui) confirmTool(name, args string) bool {
 		ch := r[0]
 		switch {
 		case ch == 13 || ch == 10:
-			t.renderStatusBar()
+			t.focusInput()
 			if len(buf) == 0 {
 				return true
 			}
 			return buf[0] != 110 && buf[0] != 78
+		case ch == 'a' || ch == 'A':
+			// 本会话全部允许：后续确认框不再弹出 —— 「过于频繁」。
+			t.approveAll = true
+			fmt.Println()
+			t.focusInput()
+			return true
 		case ch == 4 || ch == 3: // Ctrl-D / Ctrl-C
-			t.renderStatusBar()
+			t.focusInput()
 			return false
 		case ch == 127 || ch == 8: // backspace
 			if len(buf) > 0 {
@@ -946,8 +1069,21 @@ func (t *tui) renderStatusBar() {
 	if t.currentMode() != modeAuto {
 		icon = "⏸"
 	}
-	head := sThinking.Render(icon+" ") + labelStyle.Render(label) + sStatusVal.Render(" on (shift+tab to cycle)")
-	head += sStatusVal.Render(" · esc to interrupt")
+	head := sThinking.Render(icon+" ") + labelStyle.Render(label) + sStatusVal.Render(" on (Tab 切换模式)")
+	// Shift+Tab 模型指示：当前模型名短暂高亮（amber-on-maroon，同 modeFlash 风格）。
+	modelStyle := sStatusVal
+	if time.Now().Before(t.modelFlash) {
+		modelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Background(lipgloss.Color("53")).Bold(true)
+	}
+	if t.cfg.Model != "" {
+		head += sStatusVal.Render(" · ") + modelStyle.Render(t.cfg.Model) + sStatusVal.Render(" (Shift+Tab 切换模型)")
+	} else {
+		head += sStatusVal.Render(" · Shift+Tab 切换模型")
+	}
+	if t.approveAll {
+		head += sStatusVal.Render(" · ") + lipgloss.NewStyle().Foreground(lipgloss.Color("82")).Bold(true).Render("已自动允许全部工具")
+	}
+	head += sStatusVal.Render(" · esc 中断")
 	taskWord := "hide"
 	if t.hideTasks {
 		taskWord = "show"
@@ -994,11 +1130,40 @@ func (t *tui) renderUserLine(line string) {
 }
 
 func (t *tui) renderAILine(content string) {
-	lines := wrapLines(content, termWidth-4)
+	lines := wrapLines(cleanAIContent(content), termWidth-4)
 	for _, l := range lines {
 		fmt.Printf("%s\r\n", sAiText.Render(l))
 	}
 	fmt.Println()
+}
+
+// cleanAIContent 清理 LLM 输出里的 Markdown 残留，避免纯文本渲染时出现噪音：
+//   - 删除 ``` 围栏行（模型偶尔把配置 YAML 片段包进代码块，围栏本身没有信息量，
+//     夹在正文里还让排版看起来断裂）
+//   - 去掉 **粗体** / __粗体__ 标记（终端不渲染粗体，星号纯属干扰）
+//   - 去掉行首 # 标题标记
+func cleanAIContent(s string) string {
+	var b strings.Builder
+	for i, line := range strings.Split(s, "\n") {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		t := strings.TrimSpace(line)
+		if strings.HasPrefix(t, "```") {
+			continue // 整行丢弃围栏
+		}
+		line = strings.ReplaceAll(line, "**", "")
+		line = strings.ReplaceAll(line, "__", "")
+		if h := strings.TrimLeft(line, "#"); len(h) < len(line) && (h == "" || h[0] == ' ') {
+			line = strings.TrimSpace(h)
+		}
+		b.WriteString(line)
+	}
+	out := strings.TrimSpace(b.String())
+	if out == "" {
+		return s // 全是围栏的极端情况：原样输出，不吞内容
+	}
+	return out
 }
 
 // compactTail 按显示宽度截断参数摘要，超宽加 … 避免工具卡片折行错位。
@@ -1059,37 +1224,68 @@ func (t *tui) inputHeight() int {
 	return count
 }
 
-func (t *tui) redrawInputBox() {
-	txt := string(t.inputBuf)
-	lines := strings.Split(txt, "\n")
-	wrap := len(lines)
-	if wrap < 1 {
-		wrap = 1
-	}
+// drawInputLines 把输入内容画进底部输入区（占 H-1-wrap .. H-2 共 wrap 行，
+// 末行下方留一空行做视觉分隔），返回最后一行的行号。只负责绘制，不移动
+// 光标、不画分割线/状态栏——那些交给 redrawInputBox / focusInput。
+func (t *tui) drawInputLines(wrap int) int {
 	bottom := termHeight - 2
 	top := bottom - wrap + 1
 	const bodyTop = 3
 	if top < bodyTop {
 		drop := bodyTop - top
-		lines = lines[drop:]
-		wrap = len(lines)
 		top = bodyTop
+		wrap -= drop
 	}
-	for i, line := range lines {
-		row := bottom - (wrap - 1 - i)
+	if wrap < 1 {
+		wrap = 1
+	}
+	for i, line := range strings.Split(string(t.inputBuf), "\n")[:wrap] {
+		row := top + i
 		fmt.Printf("\033[%d;1H\033[2K", row)
 		if i == 0 {
 			// 中文输入每字 2 格，超长输入若直接打印会溢出换行到状态栏区域，
-			// 按最坏宽度截断到一行内（光标隐藏，无对齐问题）。
+			// 按最坏宽度截断到一行内。
 			fmt.Print(truncateDisp(t.promptStr()+line, termWidth-2))
 		} else {
 			fmt.Print(truncateDisp("  "+line, termWidth-2))
 		}
 	}
+	return bottom
+}
+
+func (t *tui) redrawInputBox() {
+	wrap := t.inputHeight()
+	if wrap < 1 {
+		wrap = 1
+	}
+	bottom := t.drawInputLines(wrap)
 	fmt.Printf("\033[%d;1H", bottom)
 	// renderStatusBar 内部会重画输入框上方的分割线、清空 H-1 并把状态栏
 	// 刷到最底行，一次调用即可，不再手动重复画线。
 	t.renderStatusBar()
+	flushStdout()
+}
+
+// focusInput 把输入焦点交还给输入框：重绘当前输入、把可见光标定位到末行
+// 文本末尾，并刷新状态栏。AI 回复结束、确认框/提问关闭后统一走这里，
+// 保证用户随时能看到光标在闪、知道该往哪儿打字。
+func (t *tui) focusInput() {
+	wrap := t.inputHeight()
+	if wrap < 1 {
+		wrap = 1
+	}
+	bottom := t.drawInputLines(wrap)
+	t.renderDividers()
+	t.renderStatusBar()
+	last := strings.Split(string(t.inputBuf), "\n")
+	col := printableLen(last[len(last)-1]) + 1
+	if maxCol := termWidth - 1; col > maxCol {
+		col = maxCol
+	}
+	if col < 1 {
+		col = 1
+	}
+	fmt.Printf("\033[%d;%dH%s", bottom, col, ShowCursor)
 	flushStdout()
 }
 
@@ -1136,6 +1332,7 @@ func (t *tui) readLine(rawMode bool) (string, error) {
 
 	// Raw mode: t.inputBuf tracks current input; redrawInputBox renders it.
 	t.inputBuf = nil
+	t.focusInput() // 进入输入态：显示光标并定位到提示符后，让焦点可见
 loop:
 	for {
 		runeBytes, err := readUtf8Rune(os.Stdin)
@@ -1172,62 +1369,56 @@ loop:
 				t.inputBuf = t.inputBuf[:len(t.inputBuf)-sz]
 				t.redrawInputBox()
 			}
-		case 27:
-			inner := make([]byte, 3)
-			n2, _ := os.Stdin.Read(inner)
-			if n2 == 0 {
-				continue
-			}
-			if inner[0] == 13 {
-				t.inputBuf = append(t.inputBuf, '\n')
-				t.redrawInputBox()
-				continue
-			}
-			if inner[0] != '[' {
-				continue
-			}
-			key := inner[1]
-			if n2 >= 3 && key == 'O' {
-				key = inner[2]
-			}
-			switch key {
-			case 'A':
-				if len(t.history) > 0 && t.histIdx > 0 {
-					t.histIdx--
-					t.inputBuf = []byte(t.history[t.histIdx])
+		case 27: // ESC — 裸 ESC / Alt+x / CSI 序列（含 Shift+Tab 的 ESC [ 1 ; 2 Z）
+			final, kind := readESCSuffix(os.Stdin)
+			switch kind {
+			case escBare: // 空闲时单按 ESC：清空当前输入行
+				if len(t.inputBuf) > 0 {
+					t.inputBuf = nil
 					t.redrawInputBox()
 				}
-			case 'B':
-				if t.histIdx < len(t.history) {
-					t.histIdx++
-					if t.histIdx < len(t.history) {
-						rawHist := t.history[t.histIdx]
-						t.inputBuf = []byte(rawHist)
-						t.redrawInputBox()
-					} else {
-						t.inputBuf = nil
+			case escAlt: // Alt+<char>：当作普通字符录入，不丢字节
+				t.inputBuf = append(t.inputBuf, final)
+				t.redrawInputBox()
+			case escCR: // ESC+Enter：插入换行（仿 Claude alt+enter）
+				t.inputBuf = append(t.inputBuf, '\n')
+				t.redrawInputBox()
+			case escCSI:
+				switch final {
+				case 'Z': // Shift+Tab：最高优先级 —— 切换 AI 模型（用户指定，覆盖反向补全/模式）
+					t.cycleModel(1)
+					t.redrawInputBox()
+				case 'A':
+					if len(t.history) > 0 && t.histIdx > 0 {
+						t.histIdx--
+						t.inputBuf = []byte(t.history[t.histIdx])
 						t.redrawInputBox()
 					}
-				}
-			case 'D':
-				if len(t.inputBuf) == 0 {
-					return "", io.EOF
-				}
-				_, sz := utf8.DecodeLastRune(t.inputBuf)
-				t.inputBuf = t.inputBuf[:len(t.inputBuf)-sz]
-				t.redrawInputBox()
-			case 'Z': // Shift+Tab：/ 命令反向补全；否则反向切换 AI 模式
-				if len(t.inputBuf) > 0 && t.inputBuf[0] == 47 {
-					t.completeTabRev(&t.inputBuf)
-				} else {
-					t.cycleMode(-1)
-				}
-				t.redrawInputBox()
-			case 'H':
-				if len(t.inputBuf) > 0 {
+				case 'B':
+					if t.histIdx < len(t.history) {
+						t.histIdx++
+						if t.histIdx < len(t.history) {
+							rawHist := t.history[t.histIdx]
+							t.inputBuf = []byte(rawHist)
+							t.redrawInputBox()
+						} else {
+							t.inputBuf = nil
+							t.redrawInputBox()
+						}
+					}
+				case 'D':
+					if len(t.inputBuf) == 0 {
+						return "", io.EOF
+					}
 					_, sz := utf8.DecodeLastRune(t.inputBuf)
 					t.inputBuf = t.inputBuf[:len(t.inputBuf)-sz]
 					t.redrawInputBox()
+				case 'H':
+					if len(t.inputBuf) > 0 {
+						_, sz := utf8.DecodeLastRune(t.inputBuf)
+						t.inputBuf = t.inputBuf[:len(t.inputBuf)-sz]
+						t.redrawInputBox()
+					}
 				}
 			}
 		default:
@@ -1248,6 +1439,13 @@ func readUtf8Rune(r io.Reader) ([]byte, error) {
 	if _, err := r.Read(first); err != nil {
 		return nil, err
 	}
+	return readUtf8RuneBuf(first, r)
+}
+
+// readUtf8RuneBuf 续读多字节字符的尾字节（first 已含首字节）。thinkLoop 的
+// stdin goroutine 一次只 Read 一字节，UTF-8 中文需要在这里拼回完整 rune，
+// 否则每个尾字节会被当成独立字符回显成乱码。
+func readUtf8RuneBuf(first []byte, r io.Reader) ([]byte, error) {
 	b := first[0]
 	switch {
 	case b < 0x80:
@@ -1271,6 +1469,59 @@ func readUtf8Tail(r io.Reader, prefix []byte, n int) ([]byte, error) {
 		return prefix, err
 	}
 	return append(prefix, tail...), nil
+}
+
+// ESC 后缀类型（readESCSuffix 返回值）。
+const (
+	escBare = iota // 单独的 ESC（或读取出错）—— 调用方自行决定语义
+	escCR          // ESC+Enter：换行
+	escAlt         // ESC+<可打印字符>：Alt+char，final 为该字节
+	escCSI         // CSI 序列（ESC [ ... final / ESC O <c>），final 为终结字节
+)
+
+// readESCSuffix 读取 ESC 之后的完整后缀并归类。旧实现一次 os.Stdin.Read 固定
+// 3 字节，在 Windows 短读下会把 'A'/'B'/'Z' 判断错位，且根本读不完 7 字节的
+// "ESC [ 1 ; 2 Z"（部分终端的 Shift+Tab）。这里逐字节 io.ReadFull（仿
+// readUtf8Tail），按 VT 语法吞掉参数字节(0x30-0x3F)与中间字节(0x20-0x2F)直到
+// 终结字节(0x40-0x7E)，因此任何长度的 CSI 都能正确识别 —— Shift+Tab 无论发
+// "ESC [ Z" 还是 "ESC [ 1 ; 2 Z" 都落到 final=='Z'。
+func readESCSuffix(r io.Reader) (final byte, kind int) {
+	b, err := readOneByte(r)
+	if err != nil {
+		return 0, escBare
+	}
+	switch b {
+	case 13, 10:
+		return b, escCR
+	case '[':
+		for {
+			c, err := readOneByte(r)
+			if err != nil {
+				return c, escCSI
+			}
+			if c >= 0x40 && c <= 0x7E { // 终结字节
+				return c, escCSI
+			}
+			// 参数/中间字节继续吞；异常控制字节提前放弃该序列
+			if c < 0x20 {
+				return c, escCSI
+			}
+		}
+	case 'O': // SS3：ESC O <c>（方向键等）
+		c, err := readOneByte(r)
+		if err != nil {
+			return c, escCSI
+		}
+		return c, escCSI
+	default:
+		return b, escAlt
+	}
+}
+
+func readOneByte(r io.Reader) (byte, error) {
+	buf := make([]byte, 1)
+	_, err := io.ReadFull(r, buf)
+	return buf[0], err
 }
 
 // tuiAsk returns an askFunc that works inside TUI raw mode. interactiveAsk
@@ -1302,17 +1553,17 @@ func (t *tui) tuiAsk() askFunc {
 		for {
 			runeBytes, err := readUtf8Rune(os.Stdin)
 			if err != nil {
-				t.renderStatusBar()
+				t.focusInput()
 				return string(buf)
 			}
 			ch := runeBytes[0]
 			switch {
 			case ch == 13, ch == 10: // Enter
-				t.renderStatusBar()
+				t.focusInput()
 				t.pendingAnswer = string(buf)
 				return string(buf)
 			case ch == 4, ch == 3: // Ctrl-D / Ctrl-C
-				t.renderStatusBar()
+				t.focusInput()
 				return ""
 			case ch == 127, ch == 8: // backspace
 				if len(buf) > 0 {
@@ -1378,6 +1629,17 @@ func (t *tui) thinkLoop(ctx context.Context, rawMode bool) (Message, error) {
 				return
 			}
 			b := one[0]
+			ensurePrompt := func() {
+				if !promptShown {
+					// First key pressed while thinking: clear the spinner
+					// line and render a fresh "❯ " so the user can see
+					// what they're typing.
+					promptShown = true
+					didPromptDuringThink = true
+					fmt.Printf("\r%s\n", ClearLn)
+					fmt.Print(t.promptStr())
+				}
+			}
 			switch {
 			case b == 13 || b == 10: // Enter
 				// Drain any trailing bytes left in the kernel buffer.
@@ -1389,31 +1651,70 @@ func (t *tui) thinkLoop(ctx context.Context, rawMode bool) (Message, error) {
 				}
 				cancel()
 				return
-			case b == 3: // Ctrl-C
+			case b == 3: // Ctrl-C：中断并把已排队输入交还输入框
+				select {
+				case inputCh <- buf:
+				default:
+				}
 				cancel()
 				return
 			case b == 4: // Ctrl-D
 				inputCh <- buf
 				cancel()
 				return
+			case b == 27: // ESC：中断 AI（仿 Claude），不吞掉后续字节 —— 交给
+				// readESCSuffix 完整解析，方向键等 CSI 序列不会被回显成乱码。
+				final, kind := readESCSuffix(os.Stdin)
+				switch kind {
+				case escCR: // ESC+Enter：排队换行
+					ensurePrompt()
+					buf = append(buf, '\n')
+					fmt.Print("\n")
+					continue
+				case escCSI:
+					switch final {
+					case 'A': // 上翻：把历史消息填入排队输入
+						ensurePrompt()
+						if len(t.history) > 0 {
+							buf = []byte(t.history[0])
+							fmt.Print(ClearLn + "\r" + t.promptStr() + string(buf))
+						}
+					case 'B': // 下翻：清空排队输入
+						ensurePrompt()
+						buf = nil
+						fmt.Print(ClearLn + "\r" + t.promptStr())
+					}
+					continue
+				case escAlt: // Alt+char：当作字符录入
+					ensurePrompt()
+					buf = append(buf, final)
+					fmt.Print(string(rune(final)))
+					continue
+				default: // escBare：裸 ESC = 中断
+					select {
+					case inputCh <- buf:
+					default:
+					}
+					cancel()
+					return
+				}
 			case b == 127 || b == 8: // backspace
 				if len(buf) > 0 {
-					buf = buf[:len(buf)-1]
-					fmt.Print("\b \b")
+					_, sz := utf8.DecodeLastRune(buf)
+					buf = buf[:len(buf)-sz]
+					for i := 0; i < sz; i++ {
+						fmt.Print("\b \b")
+					}
 				}
 			default:
 				if b >= 32 {
-					if !promptShown {
-						// First key pressed while thinking: clear the spinner
-						// line and render a fresh "❯ " so the user can see
-						// what they're typing.
-						promptShown = true
-						didPromptDuringThink = true
-						fmt.Printf("\r%s\n", ClearLn)
-						fmt.Print(t.promptStr())
+					ensurePrompt()
+					rb, err := readUtf8RuneBuf(one, os.Stdin)
+					if err != nil {
+						return
 					}
-					buf = append(buf, b)
-					fmt.Print(string(rune(b)))
+					buf = append(buf, rb...)
+					fmt.Print(string(rb))
 				}
 			}
 		}

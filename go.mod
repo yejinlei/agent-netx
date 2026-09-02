@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/charmbracelet/lipgloss v1.1.0
+	github.com/one-api/godivert v0.0.0-20260702211717-ba39873f0b8a
 	github.com/pion/stun/v2 v2.0.0
 	github.com/pkg/sftp v1.13.11
 	github.com/quic-go/quic-go v0.42.0

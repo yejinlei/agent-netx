@@ -137,10 +137,22 @@ type WebConfig struct {
 }
 
 type MitmConfig struct {
-	Enable   bool   `yaml:"enable"`
-	CAPath   string `yaml:"ca-path"`
-	CertDir  string `yaml:"cert-dir"`
-	HTTPPort int    `yaml:"http-port"`
+	Enable    bool     `yaml:"enable"`
+	CAPath    string   `yaml:"ca-path"`
+	CertDir  string   `yaml:"cert-dir"`
+	HTTPPort  int      `yaml:"http-port"`
+	// Allowlist is the set of host rules that MITM will intercept. Empty =
+	// never intercept, even with enable=true (安全红线: 默认不解密).
+	// Rule syntax matches router.Rule: DOMAIN / DOMAIN-SUFFIX / REGEX / IP-CIDR.
+	Allowlist []string `yaml:"allowlist"`
+	// SkipHosts lists rules that are NEVER intercepted, even when Allowlist
+	// matches. Safety valve for non-HTTP protocols tunnelled over 443
+	// (long-lived WebSocket, gRPC streams, custom protocols). Same syntax.
+	SkipHosts []string `yaml:"skip-hosts"`
+	// VerifyUpstream enables certificate validation of the real server on the
+	// re-encrypted upstream TLS session. Default false (relay the client's
+	// trust decision; self-signed internal hosts keep working).
+	VerifyUpstream bool `yaml:"verify-upstream"`
 }
 
 type AgentConfig struct {
@@ -175,6 +187,9 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Listen.TProxyTable == 0 {
 		cfg.Listen.TProxyTable = 100
+	}
+	if cfg.MITM.CAPath == "" {
+		cfg.MITM.CAPath = "ca"
 	}
 	if cfg.Mode == "" {
 		cfg.Mode = "rule"
@@ -295,6 +310,9 @@ func LoadFromBytes(data []byte) (*Config, error) {
 	}
 	if cfg.Listen.TProxyTable == 0 {
 		cfg.Listen.TProxyTable = 100
+	}
+	if cfg.MITM.CAPath == "" {
+		cfg.MITM.CAPath = "ca"
 	}
 	if cfg.Mode == "" {
 		cfg.Mode = "rule"
@@ -541,12 +559,15 @@ tun:
   cidr: "198.18.0.0/16"
   dns: "198.18.0.2"
 
-# MITM HTTPS inspection
+# MITM HTTPS inspection (only allowlist-matched hosts are intercepted)
 mitm:
   enable: false
   ca-path: "ca.crt"
   cert-dir: "certs"
   http-port: 8081
+  allowlist:
+    - DOMAIN,example.com
+    - DOMAIN-SUFFIX,.example.com
 
 # n2n virtual LAN (P2P VPN)
 # Can run as supernode (hub) or edge (node)

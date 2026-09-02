@@ -66,6 +66,10 @@ type Config struct {
 	BaseURL         string    `yaml:"base-url"`
 	APIKey          string    `yaml:"api-key"`
 	Model           string    `yaml:"model"`
+	// Models is the candidate list for runtime model switching (Shift+Tab in
+	// the TUI / `/model`). The primary Model is always available even when
+	// this list is empty. Not persisted in config.yml — sourced from agent.yml.
+	Models          []string  `yaml:"-"`
 	SystemPrompt    string    `yaml:"system-prompt"`
 	Mode            AgentMode `yaml:"-"`
 	ConfigPath      string    `yaml:"-"`
@@ -78,10 +82,11 @@ type Config struct {
 
 // ConfigAgent is the standalone LLM configuration read from "agent.yml".
 type ConfigAgent struct {
-	BaseURL      string `yaml:"base-url"`
-	APIKey       string `yaml:"api-key"`
-	Model        string `yaml:"model"`
-	SystemPrompt string `yaml:"system-prompt"`
+	BaseURL      string   `yaml:"base-url"`
+	APIKey       string   `yaml:"api-key"`
+	Model        string   `yaml:"model"`
+	Models       []string `yaml:"models"` // optional Shift+Tab model candidates
+	SystemPrompt string   `yaml:"system-prompt"`
 	Mode         string `yaml:"mode"`
 	MemoryPath   string `yaml:"memory-path"`
 	Timeout      int    `yaml:"timeout"`
@@ -127,7 +132,8 @@ func DefaultSystemPrompt() string {
 6. 交互模式下 ask_human 会真正弹出 ✻ 提示等待用户输入；非交互模式才会返回空/错误。不要把它当成"会失败的工具"跳过。
 7. 能从记忆复用的事实优先 recall，避免重复问用户；新事实用 remember 存入记忆。
 8. SSH 文件传输：主机信息优先用已记住的 alias；缺信息时工具会自动向用户询问并记入记忆，无需自己追问。
-9. 回复用中文，简洁。
-10. **困难即停、征求用户意见（自动模式同样适用）**：连续失败、重试未见效、或方案受阻（网络/权限/反复出错）时，立即停下来——先向用户说明当前状况与已尝试过的方案，然后用 ask_human（交互界面可直接文本提问）征求下一步选择；**禁止无限盲目重试**继续撞墙，除非用户明确说"继续重试"或"自动处理"。
-11. **参考会话历史与记忆**：每轮开始或重试前，先回顾本会话已有消息与记忆(recall) 中的结论，**不要重复已失败或已确认的方案与事实**；若新判断与历史矛盾，要显式说明原因。`
+9. 回复用中文，简洁。输出格式：TUI 按纯文本渲染，禁用 Markdown 语法——不要三反引号代码围栏、不要星号加粗、不要井号标题符号；方案与要点用「方案 A —」「- 」这类纯文本行组织。
+10. 决策单点化：需要用户选择时，把全部可选项编成一份编号清单（1、2、3…）一次性给出然后停下等待；禁止在清单之外另塞开放式追问。信息不足以区分选项时，把缺失的信息本身写成清单项（如「3. 不确定客户端是否支持代理——需先确认」），而不是追加一句提问。
+11. **困难即停、征求用户意见（自动模式同样适用）**：连续失败、重试未见效、或方案受阻（网络/权限/反复出错）时，立即停下来——先向用户说明当前状况与已尝试过的方案，然后用 ask_human（交互界面可直接文本提问）征求下一步选择；**禁止无限盲目重试**继续撞墙，除非用户明确说"继续重试"或"自动处理"。
+12. **参考会话历史与记忆**：每轮开始或重试前，先回顾本会话已有消息与记忆(recall) 中的结论，**不要重复已失败或已确认的方案与事实**；若新判断与历史矛盾，要显式说明原因。`
 }

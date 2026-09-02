@@ -103,7 +103,20 @@ func (c *CACert) SaveTo(path string) error {
 	return os.WriteFile(path+".key", c.PEMKey, 0600)
 }
 
-func (c *CACert) SignCert(commonName string, sans []string) (cert *x509.Certificate, privKey crypto.PrivateKey, err error) {
+// CertPool returns an x509 pool containing this CA as a trusted root, so
+// clients (and tests) can verify leaf certs signed by it.
+func (c *CACert) CertPool() (*x509.CertPool, error) {
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(c.PEMCert) {
+		return nil, fmt.Errorf("CA PEM could not be added to cert pool")
+	}
+	return pool, nil
+}
+
+// SignCert signs a leaf certificate for commonName with the given SANs. An
+// empty sans list falls back to commonName itself as the sole SAN, inferred as
+// an IP address or DNS name.
+func (c *CACert) SignCert(commonName string, sans ...string) (cert *x509.Certificate, privKey crypto.PrivateKey, err error) {
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, nil, fmt.Errorf("generate leaf key: %w", err)
@@ -171,7 +184,7 @@ func (i *Interceptor) GetCertForHost(host string) (tls.Certificate, error) {
 	if strings.HasPrefix(cn, "*.") {
 		cn = cn[2:]
 	}
-	cert, priv, err := i.ca.SignCert(cn, sans)
+	cert, priv, err := i.ca.SignCert(cn, sans...)
 	if err != nil {
 		return tls.Certificate{}, fmt.Errorf("sign cert for %s: %w", host, err)
 	}

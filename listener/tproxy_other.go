@@ -1,4 +1,4 @@
-//go:build !linux
+//go:build !linux && !windows
 
 package listener
 
@@ -8,10 +8,11 @@ import (
 	"runtime"
 )
 
-// tproxyListen returns a platform error on non-Linux. It is the
-// non-Linux counterpart of tproxy_linux.go.
+// tproxyListen returns a platform error on platforms without a TProxy
+// implementation. Counterpart of tproxy_linux.go (Linux) and
+// tproxy_windows.go (WinDivert).
 func tproxyListen(addr string) (net.Listener, error) {
-	return nil, fmt.Errorf("TProxy is only supported on Linux (platform=%s/%s)", runtime.GOOS, runtime.GOARCH)
+	return nil, fmt.Errorf("TProxy is only supported on Linux and Windows (platform=%s/%s)", runtime.GOOS, runtime.GOARCH)
 }
 
 // installTProxyRouting / teardownTProxyRouting are no-ops off Linux.
