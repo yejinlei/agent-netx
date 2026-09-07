@@ -8,19 +8,29 @@ import (
 	"log"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"agent-netx/config"
 	"agent-netx/proxy"
 	"agent-netx/router"
 	"agent-netx/web"
 )
 
+// RewriteFn is a callback invoked on every byte write through the relay.
+// It receives the raw bytes just written, the direction
+// ("upstream"=upstream→client, "client"=client→upstream), the proxy name,
+// and the remote address of the peer that received those bytes.
+type RewriteFn func(bytes []byte, direction string, proxyName string, peer net.Addr)
+
+// Options holds the Listener's configuration.
 type Options struct {
-	HTTPPort    int
-	SOCKS5Port  int
-	TProxyPort  int
+	HTTPPort   int
+	SOCKS5Port int
+	TProxyPort int
 	// TProxyMark / TProxyTable drive the Linux TPROXY routing loop
 	// (ip rule + ip route local). Passed to installTProxyRouting/teardown.
 	// Zero disables auto-installation (user owns routing rules).
@@ -31,21 +41,42 @@ type Options struct {
 	// whose target matches the MITM allowlist (see listener/mitm.go). nil
 	// disables interception entirely; empty allowlist disables too (安全红线).
 	MITM *MITMHandler
+	// URLActions are evaluated on both the plain-HTTP path (handleHTTP non-
+	// CONNECT) and the MITM-intercepted path. Empty = no URL-based short-
+	// circuit. Mirrored into MITMHandler.URLActions at build time.
+	URLActions []config.URLAction
 	// Stats optionally receives per-proxy traffic + connection accounting.
 	// nil disables accounting (no overhead).
 	Stats *web.StatsTracker
+	// OnLog, when non-nil, is called for every byte written during relay,
+	// with direction, proxyName, and the peer address that received the bytes.
+	// nil = no logging. MITM rewriter and flow logger both use this.
+	OnLog RewriteFn
+	// Hooks, when non-empty, are invoked on each Flow at defined lifecycle
+	// points ("request" and "done"). Return false from any hook to abort
+	// the pipeline for that flow.
+	Hooks FlowHooks
+	// Sinks, when non-empty, receive each completed Flow via Write. Multiple
+	// sinks can coexist; write order matches slice order. Never invoked for
+	// flows aborted by a Hook.
+	Sinks []FlowSink
+	// Upstream, when non-nil and IsConfigured(), is the proxy the agent
+	// itself dials through when connecting to the ultimate upstream (after
+	// Router.Pick). Corresponds to mitmproxy's -u flag: chain the outbound
+	// path so agent egress is routed through another hop.
+	Upstream *proxy.UpstreamProxy
 }
 
 type Listener struct {
 	opts Options
 
-	mu      sync.Mutex
-	httpLn  net.Listener
-	socksLn net.Listener
+	mu       sync.Mutex
+	httpLn   net.Listener
+	socksLn  net.Listener
 	tproxyLn net.Listener
-	closed  bool
-	stopCh  chan struct{}
-	errs    chan error
+	closed   bool
+	stopCh   chan struct{}
+	errs     chan error
 }
 
 func New(opts Options) (*Listener, error) {
@@ -172,16 +203,34 @@ func (l *Listener) handleHTTP(conn net.Conn) {
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
 	reqLine, err := reader.ReadString('\n')
-	if err != nil { return }
-	method, target, _, err := parseRequestLine(strings.TrimSpace(reqLine))
-	if err != nil { return }
+	if err != nil {
+		return
+	}
+	method, target, reqProto, err := parseRequestLine(strings.TrimSpace(reqLine))
+	if err != nil {
+		return
+	}
+
+	// Read the request headers while they're still on the wire. The
+	// buffered Reader holds everything up to and including the blank
+	// line that terminates the header block, so subsequent body reads
+	// still see the full payload. Body capture is deferred: knowing
+	// Content-Length and stream-limiting the first N bytes is a bigger
+	// relay rewrite. Headers are cheap and needed for keep-alive anyway.
+	reqHeaders := readRequestHeaders(reader)
 
 	if method != "CONNECT" {
 		u, err := url.Parse(target)
-		if err != nil { return }
-		if u.Scheme == "https" { return }
+		if err != nil {
+			return
+		}
+		if u.Scheme == "https" {
+			return
+		}
 		remoteAddr := u.Host
-		if !strings.Contains(remoteAddr, ":") { remoteAddr = remoteAddr + ":80" }
+		if !strings.Contains(remoteAddr, ":") {
+			remoteAddr = remoteAddr + ":80"
+		}
 
 		proxy, err := l.opts.Router.Pick(remoteAddr)
 		if err != nil {
@@ -189,21 +238,61 @@ func (l *Listener) handleHTTP(conn net.Conn) {
 			return
 		}
 
-		// Get upstream connection — through proxy or direct
-		var remote net.Conn
-		if proxy.Name() == "DIRECT" {
-			remote, err = net.DialTimeout("tcp", remoteAddr, 10*time.Second)
-		} else {
-			remote, err = proxy.Connect(context.Background(), remoteAddr)
-		}
-		if err != nil {
-			log.Printf("connect %s via %s: %v", remoteAddr, proxy.Name(), err)
+		// Build the Flow snapshot before the URLAction short-circuit so we
+		// still record which rule fired (or didn't). ClientAddr for a plain
+		// HTTP proxy is the TCP peer; FullURL is the absolute form the
+		// client sent us.
+		fl := NewFlow("http", remoteAddr, clientAddrStr(conn))
+		fl.Host = u.Host
+		fl.Method = method
+		fl.Path = u.Path
+		fl.FullURL = target
+		fl.ProxyName = proxy.Name()
+		fl.RequestProto = reqProto
+		fl.RequestHeaders = reqHeaders
+
+		// Ask hooks to make the call. A "false" here means an upstream
+		// policy rejected the request — we tell the client and record
+		// the flow before closing. This runs BEFORE the URLAction
+		// short-circuit so hooks always observe a Flow with a
+		// "request" phase before any "done" phase — otherwise a
+		// URLAction rule would emit "done" without ever emitting
+		// "request", breaking the contract every other Flow obeys.
+		if !l.opts.Hooks.Emit("request", fl) {
+			fl.Error = "hook rejected request"
+			fl.ResponseStatus = 403
+			l.emitDone(fl)
 			return
 		}
 
-		req := fmt.Sprintf("%s %s HTTP/1.1\r\nHost: %s\r\n\r\n", method, target, u.Host)
+		// URLAction short-circuit on the plain-HTTP path: evaluate rules
+		// against the full request line and the path BEFORE dialing upstream.
+		// This is the HTTP analog of the same check inside InterceptConnect,
+		// but here we have only the raw TCP conn (no TLS) so we write the
+		// response straight through.
+		if r := matchURLActions(l.opts.URLActions, strings.TrimSpace(reqLine), u.Path); r.Action != "" {
+			WriteURLResponse(conn, r)
+			fl.ResponseStatus = r.Status
+			l.emitDone(fl)
+			return
+		}
+
+		// Get upstream connection — through proxy or direct. When the
+		// router picked DIRECT and cfg.Upstream is configured, dial
+		// through that upstream instead of a raw TCP socket — the
+		// mitmproxy -u analog.
+		var remote net.Conn
+		remote, err = l.connectVia(proxy, remoteAddr)
+		if err != nil {
+			log.Printf("connect %s via %s: %v", remoteAddr, proxy.Name(), err)
+			fl.MarkError(fmt.Errorf("connect %s: %w", remoteAddr, err))
+			l.emitDone(fl)
+			return
+		}
+
+		req := fmt.Sprintf("%s %s HTTP/1.1\r\nHost: %s\r\n\r\n", method, u.RequestURI(), u.Host)
 		remote.Write([]byte(req))
-		l.relay(conn, remote, proxy.Name())
+		l.relay(&clientWithFlow{conn: conn, flow: fl}, remote, proxy.Name())
 		remote.Close()
 		return
 	}
@@ -220,11 +309,67 @@ func (l *Listener) handleHTTP(conn net.Conn) {
 	// decrypted streams. SkipHosts is a safety valve for CONNECT tunnels that
 	// carry non-HTTP protocols over 443.
 	if l.opts.MITM != nil && l.opts.MITM.ShouldIntercept(target) && !l.opts.MITM.SkipHost(target) {
+		conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 		tlsClient, upstream, firstReq, err := l.opts.MITM.InterceptConnect(conn, target)
 		if err != nil {
 			log.Printf("mitm intercept %s: %v — falling back to tunnel", target, err)
+		} else if firstReq == nil && upstream == nil {
+			// URLAction short-circuit fired inside InterceptConnect: the
+			// client already received a response and both conns are closed.
+			return
 		} else {
 			defer upstream.Close()
+			// Build a Flow for the decrypted request so JSON sinks see
+			// the same shape as plain-HTTP flows. Parse headers from the
+			// first-plaintext-request bytes returned by InterceptConnect —
+			// they contain request line + all headers + trailing blank.
+			if len(firstReq) > 0 {
+				fl := NewFlow("https-mitm", target, clientAddrStr(conn))
+				fl.Intercepted = true
+				parseFirstRequestBytes(firstReq, fl)
+				if !l.opts.Hooks.Emit("request", fl) {
+					fl.Error = "hook rejected request"
+					fl.ResponseStatus = 403
+					l.emitDone(fl)
+					upstream.Close()
+					return
+				}
+				// Write the plaintext request upstream, then read the
+				// upstream's plaintext response headers (status line +
+				// response headers + trailing blank). Buffer that so
+				// relay() can pump the first read off it, then drain.
+				// Body bytes are captured via byte counters only — the
+				// upstream response body itself is streamed straight
+				// through, same as the client request body.
+				if _, err := upstream.Write(firstReq); err != nil {
+					fl.MarkError(err)
+					l.emitDone(fl)
+					return
+				}
+				rReader := bufio.NewReader(upstream)
+				statusLine, err := rReader.ReadString('\n')
+				if err == nil {
+					rHeaders := readResponseHeaders(rReader)
+					fl.ResponseHeaders = rHeaders
+					if line := strings.TrimRight(statusLine, "\r\n"); len(line) > 0 {
+						parts := strings.Fields(line)
+						if len(parts) >= 2 {
+							fl.ResponseProto = parts[0]
+							if n, e := strconv.Atoi(parts[1]); e == nil {
+								fl.ResponseStatus = n
+							}
+						}
+					}
+					// Re-wrap upstream so the buffered response headers
+					// the reader peeked past are read first by relay().
+					upstream = &tlsBufConn{br: rReader, Conn: upstream}
+				}
+				// Wrap tlsClient so relay() finds a FlowCarrier and
+				// byte counters land on fl. clientWithFlow is a thin
+				// pass-through that implements net.Conn + FlowCarrier.
+				l.relay(&clientWithFlow{conn: tlsClient, flow: fl}, upstream, proxy.Name())
+				return
+			}
 			if firstReq != nil {
 				upstream.Write(firstReq)
 			}
@@ -233,7 +378,7 @@ func (l *Listener) handleHTTP(conn net.Conn) {
 		}
 	}
 
-	remote, err := proxy.Connect(context.Background(), target)
+	remote, err := l.connectVia(proxy, target)
 	if err != nil {
 		log.Printf("proxy connect %s via %s: %v", target, proxy.Name(), err)
 		return
@@ -244,8 +389,108 @@ func (l *Listener) handleHTTP(conn net.Conn) {
 
 func parseRequestLine(line string) (string, string, string, error) {
 	parts := strings.Fields(line)
-	if len(parts) < 2 { return "", "", "", fmt.Errorf("bad request") }
-	return parts[0], parts[1], parts[2], nil
+	if len(parts) < 2 {
+		return "", "", "", fmt.Errorf("bad request")
+	}
+	proto := ""
+	if len(parts) >= 3 {
+		proto = parts[2]
+	}
+	return parts[0], parts[1], proto, nil
+}
+
+// readResponseHeaders is the response-side twin of readRequestHeaders:
+// it consumes all response header lines from a buffered reader up to the
+// blank line (CRLF CRLF). The status line has already been read by the
+// caller; this reads only the header lines.
+func readResponseHeaders(r *bufio.Reader) []string {
+	return readRequestHeaders(r)
+}
+
+// readRequestHeaders reads all header lines from a buffered reader up to
+// and including the blank line (CRLF CRLF) that terminates the header
+// block. Returns one entry per header line as "Name: value" (trimmed of
+// trailing CRLF, no leading whitespace normalization). Does NOT read the
+// body — subsequent reads from r resume after the blank line, which is
+// exactly what a client's body starts with.
+//
+// Malformed input (EOF before blank line, oversized header line) returns
+// whatever was read so far. Callers may proceed with what they have —
+// headers are best-effort metadata.
+func readRequestHeaders(r *bufio.Reader) []string {
+	var out []string
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil && line == "" {
+			return out
+		}
+		// Strip trailing CR/LF.
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			return out
+		}
+		out = append(out, line)
+		// Guard against a maliciously huge header block. We don't need
+		// every header — the first ~50 lines covers any real request.
+		if len(out) >= 200 {
+			return out
+		}
+		if len(line) > 8192 {
+			return out
+		}
+	}
+}
+
+// parseFirstRequestBytes parses an MITM-decrypted plaintext HTTP request
+// (request line + all headers + trailing blank line, as returned by
+// InterceptConnect) and stamps Method, Path, FullURL, RequestProto,
+// RequestHeaders, and a preliminary Host onto f. It does NOT populate
+// bodies — those require Content-Length / chunked parsing, which is a
+// relay rewrite (see MANUAL §3.17).
+func parseFirstRequestBytes(b []byte, f *Flow) {
+	if f == nil || len(b) == 0 {
+		return
+	}
+	// Split into lines, preserving order. The last line is always blank.
+	var lines []string
+	cur := []byte{}
+	for _, c := range b {
+		if c == '\n' {
+			line := strings.TrimRight(string(cur), "\r\n")
+			if line == "" {
+				break
+			}
+			lines = append(lines, line)
+			cur = cur[:0]
+		} else {
+			cur = append(cur, c)
+		}
+	}
+	if len(lines) == 0 {
+		return
+	}
+	// Request line: "METHOD PATH PROTO".
+	parts := strings.Fields(lines[0])
+	if len(parts) < 2 {
+		return
+	}
+	f.Method = parts[0]
+	f.Path = parts[1]
+	if len(parts) >= 3 {
+		f.RequestProto = parts[2]
+	}
+	// Body starts after the blank line — we only have the pre-blank
+	// portion, so there's no body to save here.
+	f.RequestHeaders = lines[1:]
+	// Extract Host if present.
+	for _, h := range f.RequestHeaders {
+		if col := strings.IndexByte(h, ':'); col > 0 {
+			if strings.EqualFold(strings.TrimSpace(h[:col]), "host") {
+				f.Host = strings.TrimSpace(h[col+1:])
+				break
+			}
+		}
+	}
 }
 
 func (l *Listener) serveSOCKS5(ln net.Listener) {
@@ -267,22 +512,26 @@ func (l *Listener) handleSOCKS5(conn net.Conn) {
 	defer conn.Close()
 	buf := make([]byte, 256)
 	n, err := io.ReadFull(conn, buf[:3])
-	if err != nil || n < 3 { return }
+	if err != nil || n < 3 {
+		return
+	}
 	conn.Write([]byte{0x05, 0x00})
 
 	cmdBuf := make([]byte, 256)
 	m, err := io.ReadFull(conn, cmdBuf[:5])
-	if err != nil || m < 5 { return }
+	if err != nil || m < 5 {
+		return
+	}
 	cmd := cmdBuf[1]
 	at := cmdBuf[3]
 	switch at {
 	case 0x01:
-		io.ReadFull(conn, cmdBuf[:6])
+		io.ReadFull(conn, cmdBuf[5:10])
 	case 0x03:
 		ln := int(cmdBuf[4])
-		io.ReadFull(conn, cmdBuf[:5+ln])
+		io.ReadFull(conn, cmdBuf[5:5+ln+2])
 	case 0x04:
-		io.ReadFull(conn, cmdBuf[:18])
+		io.ReadFull(conn, cmdBuf[5:22])
 	}
 
 	// UDP ASSOCIATE (CMD 0x03): the client wants to relay UDP through us. We
@@ -329,7 +578,9 @@ func (l *Listener) handleSOCKS5(conn net.Conn) {
 
 	boundIP, boundPort := getBound(conn)
 	boundIPBytes := boundIP.To4()
-	if boundIPBytes == nil { boundIPBytes = boundIP.To16() }
+	if boundIPBytes == nil {
+		boundIPBytes = boundIP.To16()
+	}
 	resp := []byte{0x05, 0x00, 0x00, 0x01}
 	resp = append(resp, boundIPBytes...)
 	resp = append(resp, byte(boundPort>>8), byte(boundPort))
@@ -503,8 +754,8 @@ func connClosed(conn net.Conn) <-chan struct{} {
 // "upload" (local→remote). No-op when tracker is nil.
 type statsConn struct {
 	net.Conn
-	stats    *web.StatsTracker
-	proxy   string
+	stats *web.StatsTracker
+	proxy string
 }
 
 func (c *statsConn) Read(b []byte) (int, error) {
@@ -542,7 +793,22 @@ func clientAddrStr(conn net.Conn) string {
 // relay copies bidirectionally between client and remote, optionally counting
 // bytes under proxyName. It tracks active connections on the tracker too.
 // Blocks until one direction closes; closes both ends.
+//
+// When the client conn carries a Flow (via FlowCarrier), relay wraps both
+// ends in a countingConn so byte counters can be stamped onto the Flow after
+// the connection drains. That Flow is then handed to emitDone, which runs
+// the "done" hooks and pushes to every Sink.
 func (l *Listener) relay(client, remote net.Conn, proxyName string) {
+	carrier := extractFlowCarrier(client, remote)
+	var reqBytes, respBytes int64
+	// The client-side write is proxy→client (ResponseBytes); the upstream
+	// write is proxy→upstream (RequestBytes). The read side mirrors it.
+	clientW, clientR := &respBytes, &reqBytes
+	remoteW, remoteR := &reqBytes, &respBytes
+
+	client = newCountingConn(client, clientW, clientR)
+	remote = newCountingConn(remote, remoteW, remoteR)
+
 	if l.opts.Stats != nil {
 		l.opts.Stats.AddConnection(proxyName)
 		defer l.opts.Stats.RemoveConnection(proxyName)
@@ -554,6 +820,56 @@ func (l *Listener) relay(client, remote net.Conn, proxyName string) {
 	go func() { io.Copy(client, remote); done <- struct{}{}; client.Close() }()
 	<-done
 	<-done
+
+	if carrier != nil {
+		fl := carrier.Flow()
+		if fl != nil {
+			fl.RequestBytes = atomic.LoadInt64(&reqBytes)
+			fl.ResponseBytes = atomic.LoadInt64(&respBytes)
+			l.emitDone(fl)
+		}
+	}
+}
+
+// emitDone finalizes the Flow's duration, emits the "done" hook phase, and
+// writes to every configured Sink. Never called with a nil flow — the
+// nil check happens in emitDone defensively.
+func (l *Listener) emitDone(fl *Flow) {
+	if fl == nil {
+		return
+	}
+	fl.Finalize()
+	// The "done" hook can veto the sink write (e.g. an audit hook that
+	// decides a flow is PII and shouldn't land on disk).
+	if l.opts.Hooks.Emit("done", fl) {
+		for _, s := range l.opts.Sinks {
+			if s != nil {
+				s.Write(fl)
+			}
+		}
+	}
+}
+
+// dialDirect dials remoteAddr, respecting cfg.Upstream: if an upstream
+// proxy is configured, the connection is tunneled through it instead of
+// a raw TCP socket. This is where mitmproxy -u semantics plug in.
+func (l *Listener) dialDirect(ctx context.Context, remoteAddr string) (net.Conn, error) {
+	if l.opts.Upstream != nil && l.opts.Upstream.IsConfigured() {
+		return l.opts.Upstream.Connect(ctx, remoteAddr)
+	}
+	return net.DialTimeout("tcp", remoteAddr, 10*time.Second)
+}
+
+// connectVia combines Router.Pick and Upstream semantics: if the picked
+// proxy is DIRECT and Upstream is configured, tunnel through Upstream;
+// otherwise use the picked proxy's Connect. This is the single chokepoint
+// where the "mitmproxy -u" chain is applied to plain-HTTP and CONNECT
+// paths in handleHTTP and handleTProxy.
+func (l *Listener) connectVia(p proxy.Proxy, target string) (net.Conn, error) {
+	if p.Name() == "DIRECT" {
+		return l.dialDirect(context.Background(), target)
+	}
+	return p.Connect(context.Background(), target)
 }
 
 // serveTProxy accepts connections delivered by the Linux TPROXY socket option.
@@ -595,6 +911,21 @@ func (l *Listener) handleTProxy(conn net.Conn) {
 		log.Printf("tproxy: %s -> %s", client, target)
 	}
 
+	// SNI sniff: transparent connections carry no CONNECT hostname, so before
+	// falling back to the IP-CIDR allowlist we peek one TLS ClientHello off
+	// the wire (10ms deadline; any non-TLS or non-TLS-first protocol is
+	// passed through untouched) and match the SNI against the domain-based
+	// allowlist. When it hits we re-wrap the conn with the hello prefilled
+	// so tls.Server inside InterceptConnect sees the same bytes.
+	if tlsClient, upstream, firstReq, sniffed := l.trySNIMITM(conn, target); sniffed {
+		defer upstream.Close()
+		if firstReq != nil {
+			upstream.Write(firstReq)
+		}
+		l.relay(tlsClient, upstream, "TPROXY-MITM")
+		return
+	}
+
 	// MITM over TProxy: transparent connections have no CONNECT hostname —
 	// the original destination is an IP:port — so the allowlist matches by
 	// IP-CIDR rules. When it hits, TLS-terminate here (the signed cert will
@@ -631,4 +962,175 @@ func (l *Listener) handleTProxy(conn net.Conn) {
 	}
 	l.relay(conn, remote, p.Name())
 	remote.Close()
+}
+
+// trySNIMITM attempts SNI-based HTTPS interception on a TProxy connection.
+// Returns (nil, nil, nil, false) whenever the connection should NOT be
+// intercepted — no MITM handler, non-TLS first bytes, no SNI, SNI skipped,
+// SNI not in the allowlist, or InterceptConnect refused. The single true
+// return path means: "hand us these two conn, that first-req, and we're
+// handling the rest." Any sniff failure is a soft failure — we hand back to
+// the IP-CIDR / router path unchanged.
+func (l *Listener) trySNIMITM(conn net.Conn, target string) (net.Conn, net.Conn, []byte, bool) {
+	if l.opts.MITM == nil {
+		return nil, nil, nil, false
+	}
+	sniffedConn, hello, ok := peekClientHello(conn)
+	if !ok || len(hello) == 0 {
+		return nil, nil, nil, false
+	}
+	sni := parseSNI(hello)
+	if sni == "" {
+		return nil, nil, nil, false
+	}
+	if l.opts.MITM.SkipHost(sni) || !l.opts.MITM.ShouldIntercept(sni) {
+		return nil, nil, nil, false
+	}
+	wrapped := wrapWithPrefill(sniffedConn, hello)
+	tlsClient, upstream, firstReq, err := l.opts.MITM.InterceptConnect(wrapped, target)
+	if err != nil {
+		log.Printf("tproxy mitm sni=%q intercept: %v — falling back", sni, err)
+		return nil, nil, nil, false
+	}
+	return tlsClient, upstream, firstReq, true
+}
+
+// peekClientHello reads a TLS ClientHello record off conn without destroying
+// the stream. Returns (conn, helloBytes, true) on success; (conn, nil, false)
+// on any non-TLS or read failure. Uses a 10ms read deadline — TLS handshakes
+// start immediately, so a slow first byte means we're looking at something
+// that isn't going to be TLS, and the caller should keep passing it through.
+// The deadline is reset to zero (no deadline) before returning.
+func peekClientHello(conn net.Conn) (net.Conn, []byte, bool) {
+	tc, ok := conn.(*net.TCPConn)
+	if !ok {
+		return conn, nil, false
+	}
+	if err := tc.SetReadDeadline(time.Now().Add(10 * time.Millisecond)); err != nil {
+		return conn, nil, false
+	}
+	defer tc.SetReadDeadline(time.Time{})
+
+	hdr := make([]byte, 5)
+	n, err := tc.Read(hdr)
+	if err != nil || n < 5 {
+		return conn, nil, false
+	}
+	if hdr[0] != 0x16 { // TLS handshake record type
+		return conn, nil, false
+	}
+	recLen := int(hdr[3])<<8 | int(hdr[4])
+	if recLen > 4096 { // ClientHello is bounded well under this; refuse the rest
+		return conn, nil, false
+	}
+	buf := make([]byte, n+recLen)
+	copy(buf, hdr)
+	if _, err := io.ReadFull(tc, buf[5:]); err != nil {
+		return conn, nil, false
+	}
+	return conn, buf, true
+}
+
+// parseSNI extracts the server_name from a TLS ClientHello record. Walks:
+// record header (5) → handshake header (4) → version (2) → random (32) →
+// session_id (1+len) → cipher_suites (2+len) → compression (1+len) →
+// extensions (2+len) → find extension type 0x0000 → host_name (1+len).
+// Returns "" on any malformed or missing field. Never panics on short input.
+func parseSNI(record []byte) string {
+	if len(record) < 5 {
+		return ""
+	}
+	p := 5
+	if p+4 > len(record) || record[p] != 0x01 { // HandshakeType=ClientHello
+		return ""
+	}
+	p += 4 // handshake_type, length (3) — we already sized buf to the record
+	if p+2 > len(record) {
+		return ""
+	}
+	p += 2 // client version
+	if p+32 > len(record) {
+		return ""
+	}
+	p += 32 // random
+	if p+1 > len(record) {
+		return ""
+	}
+	sidLen := int(record[p])
+	p += 1 + sidLen
+	if p+2 > len(record) {
+		return ""
+	}
+	csLen := int(record[p])<<8 | int(record[p+1])
+	p += 2 + csLen
+	if p+1 > len(record) {
+		return ""
+	}
+	ccLen := int(record[p])
+	p += 1 + ccLen
+	if p+2 > len(record) {
+		return ""
+	}
+	extLen := int(record[p])<<8 | int(record[p+1])
+	p += 2
+	extEnd := p + extLen
+	if extEnd > len(record) {
+		extEnd = len(record)
+	}
+	for p+4 <= extEnd {
+		etype := int(record[p])<<8 | int(record[p+1])
+		elen := int(record[p+2])<<8 | int(record[p+3])
+		p += 4
+		if p+elen > extEnd {
+			break
+		}
+		if etype == 0x0000 && elen >= 5 {
+			// server_name list: SNL_len(2) + NameType(1) + hl(2) + host(hl).
+			// RFC 6066 §3 — host_name is an opaque <1..2^16-1>, so its
+			// length field is 2 bytes (not 1). Real ClientHellos always
+			// send hl_hi=0 for short names, but reading just the low byte
+			// makes the parser miss them entirely.
+			snl := int(record[p])<<8 | int(record[p+1])
+			q := p + 2
+			if snl != elen-2 || q+3 > extEnd {
+				p += elen
+				continue
+			}
+			if record[q] == 0x00 {
+				hn := int(record[q+1])<<8 | int(record[q+2])
+				if hn > 0 && hn <= 255 && q+3+hn <= extEnd {
+					return string(record[q+3 : q+3+hn])
+				}
+			}
+		}
+		p += elen
+	}
+	return ""
+}
+
+// peerBufConn is a net.Conn that serves an initial prefill of bytes from
+// memory before falling through to its underlying Conn. Used when a sniff
+// has already read bytes off the wire and the downstream TLS handshake
+// expects to read them again — tls.Client/Server do NOT re-issue a Read on
+// the same buffer, they consume fresh bytes, so we need this shim to hand
+// them back the sniffed ClientHello.
+type peerBufConn struct {
+	rest []byte
+	net.Conn
+}
+
+func (c *peerBufConn) Read(b []byte) (int, error) {
+	if len(c.rest) == 0 {
+		return c.Conn.Read(b)
+	}
+	n := copy(b, c.rest)
+	c.rest = c.rest[n:]
+	return n, nil
+}
+
+func wrapWithPrefill(conn net.Conn, prefill []byte) net.Conn {
+	if len(prefill) == 0 {
+		return conn
+	}
+	return &peerBufConn{rest: append([]byte(nil), prefill...), Conn: conn}
 }

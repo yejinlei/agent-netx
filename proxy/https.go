@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"strconv"
@@ -35,7 +36,14 @@ func (h *HTTPSProxy) Connect(ctx context.Context, addr string) (net.Conn, error)
 		return nil, fmt.Errorf("https proxy tls handshake: %w", err)
 	}
 
-	if err := sendConnect(tlsConn, addr); err != nil {
+	// Same per-request Basic auth pattern as HTTPProxy.Connect — HTTPS proxies
+	// speak CONNECT over a TLS tunnel to the proxy, but auth is still a
+	// CONNECT header.
+	token := ""
+	if h.cfg.Username != "" {
+		token = base64.StdEncoding.EncodeToString([]byte(h.cfg.Username + ":" + h.cfg.Password))
+	}
+	if err := sendConnect(tlsConn, addr, token); err != nil {
 		tlsConn.Close()
 		return nil, err
 	}

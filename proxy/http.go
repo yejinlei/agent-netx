@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"strconv"
@@ -36,19 +37,30 @@ func (h *HTTPProxy) Connect(ctx context.Context, addr string) (net.Conn, error) 
 		conn = tlsConn
 	}
 
+	// Basic auth is per-request (Proxy-Authorization), not per-connection —
+	// some proxies require it on every CONNECT. The token is recomputed each
+	// Connect so credentials can rotate across calls.
+	token := ""
 	if h.cfg.Username != "" {
-		return nil, fmt.Errorf("http proxy username/password auth not implemented for connect")
+		token = base64.StdEncoding.EncodeToString([]byte(h.cfg.Username + ":" + h.cfg.Password))
 	}
 
-	if err := sendConnect(conn, addr); err != nil {
+	if err := sendConnect(conn, addr, token); err != nil {
 		conn.Close()
 		return nil, err
 	}
 	return conn, nil
 }
 
-func sendConnect(conn net.Conn, addr string) error {
-	req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", addr, addr)
+// sendConnect sends a CONNECT request and reads the response. token is the
+// base64-encoded "user:pass" Basic-auth payload, or "" for no auth. 200 is
+// the only success status (407 = auth required, 403/404 = policy reject).
+func sendConnect(conn net.Conn, addr string, token string) error {
+	req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", addr, addr)
+	if token != "" {
+		req += "Proxy-Authorization: Basic " + token + "\r\n"
+	}
+	req += "\r\n"
 	if _, err := conn.Write([]byte(req)); err != nil {
 		return err
 	}
