@@ -54,6 +54,7 @@ _releases/
 build/
 tmp/
 *.py
+scripts/*.js
 
 # Search-tool caches (zvec-grep creates this per-repo)
 .zvec-grep/
