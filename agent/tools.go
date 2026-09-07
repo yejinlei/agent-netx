@@ -525,6 +525,7 @@ use        切换手动分组
 forward    SSH 风格端口转发: local(-L)/remote(-R)/dynamic(-D)/tls
 sysproxy   一键开关系统代理（Windows 注册表 / Linux gsettings）
 proxy/dns/web/tun/n2n/stunvpv  单独运行某个子服务（前台）
+replay     从 JSON-lines Flow 文件回放流量到 flow.log-path
 scp        SSH/SFTP 上传下载单个文件
 tui        启动 LLM Agent 交互模式（就是你现在用的）
 netdiag    查看进程网络端口和数据包（netstat / ss / tcpdump 等价）

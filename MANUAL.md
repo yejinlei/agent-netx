@@ -112,9 +112,9 @@ agent:  {...}          # LLM Agent 配置(迁移到 agent.yml,保留兼容)
 
 | 类型 | 必选字段 | 可选字段 | UDP | 备注 |
 |------|---------|---------|-----|------|
-| `http` | server, port | username, password | — | 明文 CONNECT |
-| `https` | server, port | sni, alpn | — | TLS CONNECT |
-| `socks5` | server, port | username, password | ✅ | CONNECT + UDP ASSOCIATE |
+| `http` | server, port | username, password | — | 明文 CONNECT,每 CONNECT 附 `Proxy-Authorization: Basic` |
+| `https` | server, port | sni, alpn, username, password | — | TLS CONNECT,认证方式同 http |
+| `socks5` | server, port | username, password | ✅ | CONNECT + UDP ASSOCIATE(SOCKS5 握手内嵌认证) |
 | `ss` / `shadowsocks` | server, port, cipher, password | — | — | ChaCha20-Poly1305 等 |
 | `trojan` | server, port, password | sni, alpn | — | TLS 伪装 HTTPS |
 | `vmess` | server, port, uuid | alterId, method | — | UUID + AEAD |
@@ -312,6 +312,30 @@ mitm:
 4. 把 `ca.crt` 装进系统/浏览器信任根
 5. 用 `--no-proxy localhost,127.0.0.1` 防止 CA 安装本身走代理
 
+**TProxy 路径下的 SNI 分流(§7.6 / §7.7 才完整)**:透明代理拿不到 CONNECT 的 host,只有目标 IP。为了让 TProxy 也能命中「域名白名单」,`handleTProxy` 在落到 IP-CIDR 判定之前先做一次 SNI 嗅探:
+
+1. 给连接设 10 ms 读超时,`Read` 5 字节(记录类型 + 版本号 + 记录长度)
+2. 记录类型不是 `0x16`(TLS)或长度 > 4096 → 立刻放弃,交回普通 TProxy passthrough
+3. 读完整个 ClientHello 记录(零拷贝:`SetReadDeadline` + `io.ReadFull`,不消费后续 TLS 数据)
+4. 手工解析 SNI 扩展(RFC 6066 §3,`etype=0x0000`);解析失败或 SNI 为空 → 放弃
+5. 用 SNI 走 `ShouldIntercept(sni) && !SkipHost(sni)` 判定
+6. 命中后把嗅探读出的字节通过 `peerBufConn` 塞回连接前面,再喂给 `InterceptConnect`(tls.Server 不会重新请求已读字节,必须靠这个 shim 把预读缓冲送回)
+7. 未命中或任何一步失败 → 走原有 IP-CIDR 判定;IP-CIDR 也未命中 → 普通 passthrough
+
+这个设计里 SNI 是「优先尝试,失败即回退」——不改变默认 deny 的三条红线,也不影响非 TLS 首字节的连接。
+
+**Origin mTLS(mitm.client-crt / mitm.client-key)**:与 §3.16 的出口代理 mTLS 是两回事。这里是给「MITM 重新加密到源站」的那条 TLS 会话挂客户端证书,给源站验证调用方身份。绝大多数站点不要求,只在企业内网端点或 pin 客户端身份的端点用到:
+
+```yaml
+mitm:
+  enable: true
+  allowlist: [DOMAIN,api.corp.example]
+  client-crt: "/etc/proxy/origin-client.crt"   # PEM
+  client-key: "/etc/proxy/origin-client.key"   # PEM(可同文件)
+```
+
+加载走 `loadClientCertPair` → `tls.X509KeyPair`,挂载在 `MITMHandler.ClientCert` 上,`upstreamTLSConfig(host)` 检测到非 nil 就设置 `tls.Config.Certificates`。**软失败**:证书或私钥任一路径读不出、或 `X509KeyPair` 解析失败,只记一行日志并继续不带 mTLS 工作(流量不中断,只是源站那边如果强要 client cert 会拒连)。Agent 工具:`mtls action=enable target=origin crt=<path>`。
+
 ### 3.9 n2n 虚拟局域网 (P2P VPN)
 
 ```
@@ -473,6 +497,175 @@ agent-netx validate -c config.yml
 ```
 
 **机制**:加载 `Config`,跑 `Validate()`,检查 mode 合法性、端口范围(0..65535)、代理类型合法性、分组类型合法性、分组/代理引用、CIDR 可解析性等,返回每条问题一行的错误列表。
+
+### 3.15 Flow 流水线(逐请求快照)
+
+**是什么**:`Flow` 是本代理对标 mitmproxy 的 Flow 概念——一次 HTTP/CONNECT/CONNECT-MITM 请求的序列化快照,是整个"请求 → 响应 → 错误 → 结束"生命周期的载体。下游消费者(日志文件、Web 面板、未来的代码内钩子)看到的都是同一个 `Flow` 对象,只是不同阶段。
+
+**配置**:
+
+```yaml
+flow:
+  enable: true
+  log-path: "./flows.jsonl"   # 每完成一个 Flow 追加一行 JSON
+  max-flows: 10000            # 预留:未来内存环形缓冲上限
+```
+
+**默认关闭**——`enable: false` 是硬开关,即使 `log-path` 非空也不写。想开必须同时 `enable: true` 和填 `log-path`。
+
+**每条 JSON 长这样**(字段名与 `listener/flow.go` 里的 `Flow` 结构体 tag 一致):
+
+```json
+{"id":"00000001","timestamp":"2026-09-05T10:15:30.123+08:00","protocol":"http",
+ "target":"example.com:443","host":"example.com","method":"GET","path":"/foo",
+ "full_url":"https://example.com/foo","client_addr":"127.0.0.1:54321",
+ "proxy_name":"UPSTREAM:HTTP","response_status":200,"response_proto":"HTTP/1.1",
+ "duration":123456789,"request_bytes":214,"response_bytes":1048576,
+ "intercepted":false,"request_proto":"HTTP/1.1"}
+```
+
+`protocol` 取值:`http`(普通 CONNECT 或明文 HTTP) / `https-mitm`(经 MITM 解密) / `socks5` / `tproxy`(透明代理路径)。`intercepted: true` 表示经过 MITM 白名单命中并解密。
+
+**为什么要有**:之前的 `/web/traffic` 端点只能看到累计字节和连接数,出问题只能靠抓包排查。Flow 让每一次请求都可回放——一条 JSON 就能定位"哪个客户端在什么时间请求了什么 URL、走哪个上游、耗时多少、出错了吗"。跟 mitmproxy 的 `--set flow-detail-level` 是同一思路。
+
+**注意**:当前 Flow 粒度是"每个 TCP 连接一个",不是"每个 HTTP 请求一个"。底层 `relay` 是纯字节中转,一个 keep-alive 连接里的多个请求只会被记成一条 Flow。要 per-request 需要把 relay 换成 `http.Server` + `http.Transport`(见下方 HTTP/2 限制)。
+
+### 3.16 Upstream 出口代理链(mitmproxy `-u` 对标)
+
+**是什么**:让 agent 自己产生的所有上游连接都再经另一个代理转发一次。相当于 `mitmproxy -u http://...` 的语义——agent 不再直连目标,而是先把连接建到你指定的上游代理上,再由那个代理去连真正的目标。
+
+**配置**:
+
+```yaml
+upstream:
+  url: "http://127.0.0.1:3128"   # 或 socks5://user:pass@10.0.0.1:1080
+  timeout: 10                     # 秒,0 = 30s 默认
+```
+
+**支持的 scheme**:`http://` / `https://` / `socks5://`(带可选 `user:pass`)。其他 scheme(如 `ftp://`)在加载配置时就报错,不会静默失效。默认端口:`http://https://` = 3128,`socks5://` = 1080。
+
+**生效范围**:所有 DIRECT 路径都会走上游——包括:
+- 明文 HTTP 转发(客户端连非 80/443 端口)
+- CONNECT 隧道目标端拨号
+- TProxy passthrough
+- MITM 解密后的重新加密
+
+**不生效范围**:被 router 明确分到某个非 DIRECT proxy 的请求走的是那个 proxy 的 `Connect()`,不再叠加 upstream。想组合使用请通过 proxy-groups 里的 `Chain` 类型来显式串联。
+
+**典型用法**:
+1. 企业出口代理——本机没直连,所有流量必须经 `proxy.corp:8080` 出去
+2. 双出口流量切换——本机拨号到 SOCKS5 代理,agent 的所有上游再走这条隧道
+3. 分层 MITM——上游本身也是 mitmproxy,做二段审计
+
+**注意**:HTTPS 上游用 `https://` scheme 时,agent 会跳 `tls.Config.InsecureSkipVerify`,原因是很多出口代理用自签证书。要校验请改为 `http://` + 外层再加一层 TLS 终端代理。
+
+**mTLS(客户端证书)**:有些出口代理要求客户端出示证书(常见于企业内 CA、私有 VPN 网关)。设 `client-crt` / `client-key` 为 PEM 文件路径即可——两者都必须是 PEM(不支持 PKCS#12,那需要密码,配置里没有这个字段):
+
+```yaml
+upstream:
+  url: "https://proxy.corp.example.com:8443"
+  client-crt: "/etc/proxy/client.crt"
+  client-key: "/etc/proxy/client.key"
+```
+
+证书解析失败是软失败:agent 会打个 log 然后按"不带客户端证书"继续连——不会拒绝启动。Agent 工具 `mtls action=enable target=upstream crt=...` / `mtls action=disable target=upstream` 可以运行时切换。
+
+另一个 mTLS 场景是 **origin mTLS**(`mitm.client-crt` / `mitm.client-key`),给 MITM 重加密到源站的 TLS 会话挂客户端证书,详见 §3.8。两个作用域互不干扰、可以并存——同一条连接可能同时走出口代理 mTLS 和源站 mTLS。Agent 工具同一枚 `mtls`,靠 `target` 字段区分。
+
+### 3.17 HTTP/2 支持状态(重要边界)
+
+**当前不支持**。MITM 拦截器 `NextProtos` 强制为 `["http/1.1"]`,客户端请求的 ALPN 会拿到 HTTP/1.1 降级响应。这是有意的:当前 MITM 用"读首行 → 字节 relay"的架构,HTTP/2 的 HPACK 帧在这套代码里没法解析,开了就是错乱。
+
+**为什么不做全量 HTTP/2**:mitmproxy 的 HTTP/2 拦截是靠 `h2` 库 + 每个请求走完整 server/transport 循环,不是字节 relay。要复刻需要把 `listener/mitm.go` 从"读首行 + relay"改成 `http.Server` + `http.Transport` 双端点,同时把 `Flow` 粒度从"每连接"降到"每请求"。这是一次架构级重写,预估 200+ 行 diff,当前未排期。
+
+**如果你必须**:
+- 应用侧降协议——curl 加 `--http1.1`,浏览器加 `--disable-http2`
+- 走 SOCKS5 直连,不做 MITM 拦截(HTTP/2 帧透传不影响)
+
+### 3.18 URL 规则三种 action(block / redirect / inject)
+
+`mitm.url-actions` 列表按顺序评估,**首命中生效**。三种 action:
+
+| action | 用途 | 状态码默认 | 响应头 | 响应体 |
+|---|---|---|---|---|
+| `block` | 屏蔽 URL,返回错误页 | 403 | 固定 `text/html` | 用户自定义 body |
+| `redirect` | 302 跳走 | 302 | 固定 `text/html` + Location | 自动生成的跳转页 |
+| `inject` | **合成任意响应**(mock API、自定义 404、CDN 边缘脚本)| 200 | **用户完全自定义** | 逐字节透传 |
+
+`inject` 对标 mitmproxy 的 response-modification addon,允许把请求变成任意 JSON/XML/文本响应,不需要真的连到上游。示例:
+
+```yaml
+mitm:
+  url-actions:
+    - match: "/api/status"
+      action: inject
+      status: 200
+      headers:
+        - "Content-Type: application/json"
+      body: '{"ok":true}'
+```
+
+Agent 工具 `url_action` 支持 add/remove/list,可运行时增删而不必重启代理(下一次 `buildRouter` 生效)。
+
+### 3.19 Flow 回放(replay 子命令)
+
+`agent-netx replay --file flows.jsonl` 把 `--dump-file` 抓下来的 JSON-lines 逐行读回,重新喂给当前配置里的 `flow.log-path` 指向的 sink。**只做离线数据搬运,不会发出真实网络请求**——目的是把历史流量导入到测试环境的 sink,或把一份 dump 合并进另一份。
+
+前置条件:`flow.enable=true` 且 `flow.log-path` 非空,否则 replay 会直接拒绝运行。
+
+Agent 工具 `flow replay=...` 是这个子命令的封装,LLM 可以直接触发回放而不用记住子命令名。
+
+### 3.20 Flow SQLite Sink(结构化存储)
+
+`flow.db-path` 打开结构化存储:每个 Flow 变成 SQLite 表里的一行,可以用 SQL 直接查。跟 `log-path` 完全独立——两个都配就都写,一个不配就只写另一个。
+
+```yaml
+flow:
+  enable: true
+  log-path: "./flows.jsonl"     # JSON lines,人肉 tail -f
+  db-path:  "./flows.sqlite"    # SQLite,SQL 可查
+```
+
+**表结构**(`flows` 表,定义在 `listener/sqlite_sink.go`):
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | TEXT PK | Flow ID(十六进制 8 位) |
+| `ts` | TEXT | RFC3339Nano 时间戳 |
+| `protocol` | TEXT | `http` / `https-mitm` / `socks5` / `tproxy` |
+| `target` | TEXT | `host:port` |
+| `client_addr` | TEXT | 客户端地址 |
+| `method`, `path`, `full_url` | TEXT | HTTP 三元组 |
+| `proxy_name` | TEXT | 命中的上游代理名 |
+| `response_status`, `response_proto` | INT, TEXT | 响应状态 |
+| `error` | TEXT | 出错时的错误字符串 |
+| `duration_ns` | INT | 时长(纳秒,移植性好) |
+| `request_bytes`, `response_bytes` | INT | 字节计数 |
+| `intercepted` | INT | 0/1,是否经 MITM 解密 |
+| `request_proto` | TEXT | `HTTP/1.1` 等 |
+| `request_headers`, `response_headers` | TEXT | JSON 数组,`["Name: value", ...]` |
+| `request_body`, `response_body` | TEXT | base64 编码,空 body 存 NULL |
+
+两个索引:`idx_flows_ts`(`ts DESC`,查最近的)、`idx_flows_target`(按目标 host)。WAL 模式 + `busy_timeout=5000`,支持读写并发,写路径串行化(单个 WAL 写者)。
+
+**典型查询**:
+
+```sql
+-- 最近 20 条
+SELECT id, ts, protocol, target, response_status FROM flows ORDER BY ts DESC LIMIT 20;
+-- 某个 host 的所有 4xx/5xx
+SELECT ts, method, path, response_status, error FROM flows
+WHERE target LIKE '%example.com%' AND response_status >= 400;
+-- 某客户端的完整请求列表(含请求头)
+SELECT ts, method, path, json_extract(request_headers, '$[*]') AS hdrs
+FROM flows WHERE client_addr LIKE '10.0.0.%';
+```
+
+**编码选择理由**:base64 存 body 是因为 TEXT 列不能可靠区分"空字符串"和"未设置";body 里可能有二进制字节(不是 UTF-8),base64 保证无损。时长用 int64 ns 而不是字符串,是为了能在 SQL 里直接算 `SUM(duration_ns)/COUNT(*)` 求平均。Header 用 JSON 数组而不是展开表,是为了保留原始顺序且方便 `json_extract` 查询。
+
+**跟 `log-path` 的分工**:JSON lines 是给人读、给 `jq`/`tail` 用的;SQLite 是给程序查、给分析脚本用的。两者不冲突,可以都开——很多生产配置就两个都写,JSON 用来 `tail -f` 观察实时流量,SQLite 用来跑历史报表。
+
+**Agent 工具**:`flow set db-path=<path>` 可以运行时改路径,`flow dump` 会打印最新一批 Flow 概要。
 
 ---
 
@@ -1511,14 +1704,27 @@ rules:
                           [tproxy 监听 :7892 (loopback)]
                                    │
                                    ▼
-                          [handleTProxy]──► ShouldInterceptIP / SkipHost 决策
+                          [handleTProxy]
+                                   │
+                       ┌───────────┴───────────┐
+                       │ trySNIMITM (SNI 分流)   │
+                       │  读 5 字节 → 若 TLS:      │
+                       │  读 ClientHello → 解析   │
+                       │  ShouldIntercept(sni)   │
+                       └───────────┬───────────┘
                                    │
                               ┌────┴────┐
                               ▼         ▼
-                          命中 allowlist  未命中
-                              │         │
-                              ▼         ▼
-                          MITM 解密   直连目标(透明放行)
+                     SNI 命中          未命中
+                     allowlist         │
+                         │         ShouldInterceptIP
+                         │         兜底(§3.8)
+                         ▼         │
+                     MITM 解密   ┌──┴──┐
+                         │       ▼     ▼
+                         ▼   命中   直连目标(透明放行)
+                     (peerBufConn 把
+                      预读字节塞回连接)
 ```
 
 **机制**:
@@ -1527,7 +1733,8 @@ rules:
 - **双向全 NAT 到 loopback**:源端改为 `127.0.0.1:<fakeP>`(40000..59999 端口池),目的端改为 `127.0.0.1:<tproxy port>`。回复走原生 loopback 路径,零翻译
 - `Accept` 严格按 fake 端口池 + conntrack 查找判定;未知/陈旧/越界 → close(与 Linux fail-closed 对齐)
 - `mark/table`(Linux fwmark)在 Windows 是 no-op
-- **安全红线**:平台文件不做拦截决策,只呈现原始目的给 `handleTProxy`,由 `ShouldInterceptIP/SkipHost` 判定(与 Linux 路径一致)
+- **SNI 分流**(§3.8 详):透明连接没有 CONNECT host,`handleTProxy` 先读 5 字节判断是否 TLS;是 TLS 就读完整 ClientHello 并解析 SNI,用 SNI 走 allowlist 域名匹配。命中后用 `peerBufConn` 把预读的 ClientHello 塞回连接再喂给 `InterceptConnect`。未命中回退到 IP-CIDR 判定
+- **安全红线**:平台文件不做拦截决策,只呈现原始目的给 `handleTProxy`,由 `trySNIMITM` + `ShouldInterceptIP` + `SkipHost` 三级判定(与 Linux 路径一致)
 
 **使用步骤**:
 1. `config.yml`:
@@ -1590,6 +1797,8 @@ ip route local table 100                       接受 IP_ORIGDSTADDR=原始目�
 6. `agent-netx start -c config.yml`
 
 代码自动安装 `ip rule` + `ip route` 路由环(若 `tproxy-mark != 0`),但 `iptables` 那条用户自己配(因为 iptables 规则要区分目的端口、协议等细节)。
+
+**SNI 分流**:与 §7.6 一致,`handleTProxy` 在 TProxy 路径下先做一次 SNI 嗅探(§3.8 详),命中 allowlist 域名就走 MITM,否则回退到 IP-CIDR 判定或透明放行。
 
 ### 7.8 TUN 透明代理 + 组网
 
