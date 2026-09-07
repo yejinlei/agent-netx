@@ -54,3 +54,15 @@ _releases/
 build/
 tmp/
 *.py
+
+# Search-tool caches (zvec-grep creates this per-repo)
+.zvec-grep/
+
+# Manual test sandboxes (throwaway working dirs for try-MITM, etc.)
+test-mimt/
+test-mitm/
+test-*/
+
+# Runtime pid files & stale backups
+*.pid
+*.bak
