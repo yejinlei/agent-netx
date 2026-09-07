@@ -8,10 +8,12 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"agent-netx/config"
 	"agent-netx/mitm"
 )
 
@@ -322,3 +324,154 @@ func TestInterceptConnectUpstreamFailureKeepsConnUsable(t *testing.T) {
 		t.Errorf("bytes = %q, want %q", buf, "probe")
 	}
 }
+
+func TestMatchURLActions(t *testing.T) {
+	tests := []struct {
+		name      string
+		rules     []config.URLAction
+		firstLine string
+		path      string
+		want      URLActionResult
+	}{
+		{
+			name:      "no rules",
+			rules:     nil,
+			firstLine: "GET /foo HTTP/1.1",
+			path:      "/foo",
+			want:      URLActionResult{},
+		},
+		{
+			name:      "no match",
+			rules:     []config.URLAction{{Match: "/block", Action: "block"}},
+			firstLine: "GET /other HTTP/1.1",
+			path:      "/other",
+			want:      URLActionResult{},
+		},
+		{
+			name:      "substring block with defaults",
+			rules:     []config.URLAction{{Match: "/admin", Action: "block"}},
+			firstLine: "GET /admin/panel HTTP/1.1",
+			path:      "/admin/panel",
+			want:      URLActionResult{Action: "block", Status: 403, RuleMatch: "/admin"},
+		},
+		{
+			name: "substring block custom status and body",
+			rules: []config.URLAction{{
+				Match: "/api/v2", Action: "block", Status: 429,
+				Body: "rate limited",
+			}},
+			firstLine: "POST /api/v2/foo HTTP/1.1",
+			path:      "/api/v2/foo",
+			want:      URLActionResult{Action: "block", Status: 429, Body: "rate limited", RuleMatch: "/api/v2"},
+		},
+		{
+			name: "redirect with explicit location",
+			rules: []config.URLAction{{
+				Match: "/old", Action: "redirect",
+				Location: "https://example.com/new",
+			}},
+			firstLine: "GET /old HTTP/1.1",
+			path:      "/old",
+			want:      URLActionResult{Action: "redirect", Status: 302, Location: "https://example.com/new", RuleMatch: "/old"},
+		},
+		{
+			name: "redirect with custom status",
+			rules: []config.URLAction{{
+				Match: "/moved", Action: "redirect", Status: 301,
+				Location: "https://example.com/new",
+			}},
+			firstLine: "GET /moved HTTP/1.1",
+			path:      "/moved",
+			want:      URLActionResult{Action: "redirect", Status: 301, Location: "https://example.com/new", RuleMatch: "/moved"},
+		},
+		{
+			name:      "redirect with empty location — rule skipped",
+			rules:     []config.URLAction{{Match: "/x", Action: "redirect", Location: ""}},
+			firstLine: "GET /x HTTP/1.1",
+			path:      "/x",
+			want:      URLActionResult{},
+		},
+		{
+			name:      "empty match skipped",
+			rules:     []config.URLAction{{Match: "", Action: "block"}},
+			firstLine: "GET /foo HTTP/1.1",
+			path:      "/foo",
+			want:      URLActionResult{},
+		},
+		{
+			name:      "regex match against full request line",
+			rules:     []config.URLAction{{Match: "^GET /v2/.*", Regex: true, Action: "redirect", Location: "https://example.com/v3"}},
+			firstLine: "GET /v2/users HTTP/1.1",
+			path:      "/v2/users",
+			want:      URLActionResult{Action: "redirect", Status: 302, Location: "https://example.com/v3", RuleMatch: "^GET /v2/.*"},
+		},
+		{
+			name:      "regex doesn't match POST",
+			rules:     []config.URLAction{{Match: "^GET /v2/.*", Regex: true, Action: "redirect", Location: "https://example.com/v3"}},
+			firstLine: "POST /v2/users HTTP/1.1",
+			path:      "/v2/users",
+			want:      URLActionResult{},
+		},
+		{
+			name:      "regex against path fragment",
+			rules:     []config.URLAction{{Match: `/block[0-9]+`, Regex: true, Action: "block", Status: 403, Body: "gone"}},
+			firstLine: "GET /block42 HTTP/1.1",
+			path:      "/block42",
+			want:      URLActionResult{Action: "block", Status: 403, Body: "gone", RuleMatch: `/block[0-9]+`},
+		},
+		{
+			name:      "first match wins",
+			rules:     []config.URLAction{{Match: "/api", Action: "block", Status: 403, Body: "first"}, {Match: "api/v2", Action: "block", Status: 404, Body: "second"}},
+			firstLine: "GET /api/v2 HTTP/1.1",
+			path:      "/api/v2",
+			want:      URLActionResult{Action: "block", Status: 403, Body: "first", RuleMatch: "/api"},
+		},
+		{
+			name:      "unknown action falls back to block 501",
+			rules:     []config.URLAction{{Match: "/foo", Action: "munge"}},
+			firstLine: "GET /foo HTTP/1.1",
+			path:      "/foo",
+			want:      URLActionResult{Action: "block", Status: 501, Body: "unsupported action", RuleMatch: "/foo"},
+		},
+		{
+			name:      "case sensitive substring",
+			rules:     []config.URLAction{{Match: "/Admin", Action: "block"}},
+			firstLine: "GET /admin HTTP/1.1",
+			path:      "/admin",
+			want:      URLActionResult{},
+		},
+		{
+			name:      "bad regex skipped",
+			rules:     []config.URLAction{{Match: "(", Regex: true, Action: "block"}},
+			firstLine: "GET /foo HTTP/1.1",
+			path:      "/foo",
+			want:      URLActionResult{},
+		},
+		{
+			name:      "inject action default status",
+			rules:     []config.URLAction{{Match: "/api", Action: "inject", Headers: []string{"Content-Type: application/json"}, Body: `{"ok":true}`}},
+			firstLine: "GET /api/x HTTP/1.1",
+			path:      "/api/x",
+			want:      URLActionResult{Action: "inject", Status: 200, Body: `{"ok":true}`, Headers: []string{"Content-Type: application/json"}, RuleMatch: "/api"},
+		},
+		{
+			name:      "inject action custom status",
+			rules:     []config.URLAction{{Match: "/api", Action: "inject", Status: 503, Body: "gone"}},
+			firstLine: "GET /api HTTP/1.1",
+			path:      "/api",
+			want:      URLActionResult{Action: "inject", Status: 503, Body: "gone", RuleMatch: "/api"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := matchURLActions(tt.rules, tt.firstLine, tt.path)
+			// URLActionResult now contains a []string field, so != can't
+			// compare; use reflect.DeepEqual.
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("matchURLActions() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+

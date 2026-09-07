@@ -713,6 +713,7 @@ func Execute() {
 	rootCmd.AddCommand(tunCmd())
 	rootCmd.AddCommand(n2nCmd())
 	rootCmd.AddCommand(stunvpvCmd())
+	rootCmd.AddCommand(replayCmd())
 	rootCmd.AddCommand(wireguardCmd())
 	rootCmd.AddCommand(frpCmd())
 	rootCmd.AddCommand(tincCmd())

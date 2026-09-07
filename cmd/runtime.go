@@ -2,8 +2,12 @@ package cmd
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"log"
 	"net"
+	"os"
+	"time"
 
 	"agent-netx/agent"
 	"agent-netx/config"
@@ -106,7 +110,11 @@ func runProxy(ctx context.Context, cfg *config.Config, logRing *web.LogRing, sta
 		TProxyTable: cfg.Listen.TProxyTable,
 		Router:      rtr,
 		MITM:        buildMITMHandler(cfg, logRing),
+		URLActions:  cfg.MITM.URLActions,
 		Stats:       stats,
+		Hooks:       buildFlowHooks(cfg),
+		Sinks:       buildFlowSinks(cfg),
+		Upstream:    buildUpstreamProxy(cfg),
 	})
 	if err != nil {
 		return fmt.Errorf("init listener: %w", err)
@@ -292,14 +300,125 @@ func buildMITMHandler(cfg *config.Config, logRing *web.LogRing) *listener.MITMHa
 	if logRing != nil {
 		logRing.Write(web.INFO, "mitm: HTTPS interception ready (allowlist=%d rules)", len(cfg.MITM.Allowlist))
 	}
-	return &listener.MITMHandler{
+	var mitmLogFile *os.File
+	if cfg.MITM.LogPath != "" {
+		f, err := os.OpenFile(cfg.MITM.LogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			log.Printf("mitm: open log %s: %v", cfg.MITM.LogPath, err)
+		} else {
+			mitmLogFile = f
+		}
+	}
+	mh := &listener.MITMHandler{
 		Interceptor:    mitm.NewInterceptor(caCert, cfg.MITM.CertDir),
 		Allowlist:      cfg.MITM.Allowlist,
 		SkipHosts:      cfg.MITM.SkipHosts,
 		VerifyUpstream: cfg.MITM.VerifyUpstream,
 		EgressProxy:    nil,
+		RewriteRules:   cfg.MITM.Rewrite,
+		LogFile:        mitmLogFile,
+		URLActions:     cfg.MITM.URLActions,
 	}
+	if cfg.MITM.ClientCrt != "" || cfg.MITM.ClientKey != "" {
+		cert, cerr := loadClientCertPair(cfg.MITM.ClientCrt, cfg.MITM.ClientKey)
+		if cerr != nil {
+			log.Printf("mitm: client cert: %v (continuing without origin mTLS)", cerr)
+		} else {
+			mh.ClientCert = cert
+		}
+	}
+	return mh
 }
 
 // (MITM interception used to run as a standalone subsystem here; it now lives
 // inside runProxy via buildMITMHandler, which is the canonical init path.)
+
+// buildFlowSinks returns the FlowSink slice for the listener. Two sinks
+// are wired: a JSON-line writer (config.Flow.LogPath) and an optional
+// SQLite writer (config.Flow.DBPath). Both fire on every Flow when both
+// are configured; enable=false returns nil.
+func buildFlowSinks(cfg *config.Config) []listener.FlowSink {
+	if !cfg.Flow.Enable {
+		return nil
+	}
+	var sinks []listener.FlowSink
+	if cfg.Flow.LogPath != "" {
+		s, err := listener.NewJSONFlowSink(cfg.Flow.LogPath)
+		if err != nil {
+			log.Printf("flow: cannot open log %s: %v", cfg.Flow.LogPath, err)
+		} else {
+			sinks = append(sinks, s)
+		}
+	}
+	if cfg.Flow.DBPath != "" {
+		s, err := listener.NewSQLiteSink(cfg.Flow.DBPath)
+		if err != nil {
+			log.Printf("flow: cannot open sqlite db %s: %v", cfg.Flow.DBPath, err)
+		} else {
+			sinks = append(sinks, s)
+		}
+	}
+	return sinks
+}
+
+// buildFlowHooks returns the FlowHooks slice. Reserved for future in-code
+// policy hooks (e.g. a rate-limiter, a PII-redactor, a per-client denylist);
+// config does not expose them yet, so this returns nil. Keeping the factory
+// means future config-driven hooks are a one-file change, not a wiring
+// change in runProxy.
+func buildFlowHooks(cfg *config.Config) listener.FlowHooks {
+	return nil
+}
+
+// buildUpstreamProxy parses cfg.Upstream.URL into an outbound UpstreamProxy.
+// Nil URL or parse error → nil (no upstream chain; dials go direct). The
+// listener's dialDirect falls back to a raw TCP dial when this returns nil,
+// so a malformed upstream URL is a soft failure: traffic keeps flowing.
+// When cfg.Upstream.ClientCrt/ClientKey are set, the pair is loaded and
+// presented on the outbound TLS session (mTLS to the egress proxy). A
+// malformed pair is a soft failure too — the upstream still works without
+// the cert, matching mitmproxy's `-u` behavior.
+func buildUpstreamProxy(cfg *config.Config) *proxy.UpstreamProxy {
+	if cfg.Upstream.URL == "" {
+		return nil
+	}
+	timeout := time.Duration(cfg.Upstream.Timeout) * time.Second
+	u, err := proxy.NewUpstreamProxy(cfg.Upstream.URL, timeout)
+	if err != nil {
+		log.Printf("upstream: %v", err)
+		return nil
+	}
+	if cfg.Upstream.ClientCrt != "" || cfg.Upstream.ClientKey != "" {
+		cert, cerr := loadClientCertPair(cfg.Upstream.ClientCrt, cfg.Upstream.ClientKey)
+		if cerr != nil {
+			log.Printf("upstream: client cert: %v (continuing without mTLS)", cerr)
+		} else {
+			u.SetClientCert(cert)
+		}
+	}
+	return u
+}
+
+// loadClientCertPair loads a PEM client cert + key pair into a
+// tls.Certificate. Both paths must be non-empty; partial config is an
+// error (a cert without a key can't complete a handshake). Only PEM is
+// accepted — PKCS#12 is a common corporate format but parsing it would
+// require either a password (not exposed in config) or an external tool.
+func loadClientCertPair(crtPath, keyPath string) (*tls.Certificate, error) {
+	if crtPath == "" || keyPath == "" {
+		return nil, fmt.Errorf("both client-crt and client-key required")
+	}
+	crtPEM, err := os.ReadFile(crtPath)
+	if err != nil {
+		return nil, fmt.Errorf("read crt %q: %w", crtPath, err)
+	}
+	keyPEM, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("read key %q: %w", keyPath, err)
+	}
+	cert, err := tls.X509KeyPair(crtPEM, keyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("parse pair: %w", err)
+	}
+	return &cert, nil
+}

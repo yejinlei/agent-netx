@@ -110,6 +110,68 @@ mitm:
   # verify-upstream: validate the real server's cert on the re-encrypted
   # upstream TLS session (default false):
   verify-upstream: false
+  # client-crt/client-key: mount a PEM client cert on the MITM re-encryption
+  # upstream session (mTLS to the origin server). Rarely needed — most
+  # origins don't require client auth — but supported for corporate
+  # endpoints that pin the caller's identity. Leave empty for plain TLS.
+  # client-crt: "/etc/proxy/origin-client.crt"
+  # client-key: "/etc/proxy/origin-client.key"
+  # url-actions: per-request pattern→response rules. Actions:
+  #   block    — return status+body as text/html (default status 403)
+  #   redirect — return a 302 (or your chosen status) with Location
+  #   inject   — return status+headers+body verbatim (default status 200)
+  # First match wins (evaluated in order). Agent tool: `url_action`.
+  #url-actions:
+  #  - match: "/admin"
+  #    action: block
+  #    status: 403
+  #    body: "access denied"
+  #  - match: "/login"
+  #    action: redirect
+  #    location: "https://sso.example.com/login"
+  #  - match: "/api/status"
+  #    action: inject
+  #    status: 200
+  #    headers:
+  #      - "Content-Type: application/json"
+  #      - "Cache-Control: no-store"
+  #    body: '{"ok":true,"ts":1720000000}'
+  #  - match: "^GET /v2/ping HTTP"
+  #    regex: true
+  #    action: inject
+  #    headers:
+  #      - "Content-Type: text/plain"
+  #    body: "pong"
+
+# Per-request Flow pipeline (mitmproxy Flow analog).
+# Every HTTP/CONNECT/CONNECT-MITM request produces one Flow at end-of-conn
+# (or on hook veto), serialized to whichever sinks you configure. Both
+# log-path and db-path may be set — they are independent sinks and fire
+# on every Flow. log-path writes JSON lines (human-friendly, tail -f);
+# db-path writes to a SQLite table (SQL-queryable, indexed on ts and
+# target). Either may be empty to disable that sink.
+#   --dump-file <path> is a CLI alias for log-path (start/proxy only).
+#   Replay is a separate subcommand: `agent-netx replay --file flows.jsonl`
+#   reads JSON-lines back and emits them to the sinks configured here.
+#flow:
+#  enable: true
+#  log-path: "./flows.jsonl"
+#  db-path:  "./flows.sqlite"     # SQLite sink; WAL mode, 2 indexes
+#  max-flows: 10000        # in-memory ring cap for the /web/flows endpoint
+
+# Outbound proxy chain (mitmproxy -u equivalent).
+# Every upstream dial made by this agent — including CONNECT tunnels, plain
+# HTTP, TProxy passthrough, and MITM re-encryption — is routed through this
+# proxy when configured. Empty url = direct dial (default).
+# Supported schemes: http://  https://  socks5:// (with optional user:pass).
+# client-crt/client-key mount a TLS client certificate on the outbound
+# connection to this upstream (mTLS to the egress proxy). Leave empty for
+# plain TLS (no client auth) or non-TLS upstreams.
+#upstream:
+#  url: "http://127.0.0.1:8080"
+#  timeout: 10
+#  client-crt: "/etc/proxy/client.crt"
+#  client-key: "/etc/proxy/client.key"
 
 # n2n virtual LAN (P2P VPN)
 # Can run as supernode (hub) or edge (node)

@@ -1,12 +1,15 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
 
 	"agent-netx/config"
+	"agent-netx/listener"
 	"agent-netx/web"
 
 	"github.com/spf13/cobra"
@@ -132,4 +135,89 @@ func stunvpvCmd() *cobra.Command {
 	}
 	cmd.Flags().Bool("no-tun", false, "不将 TUN 网桥接入 stunvpv client（仅中继/测试模式）")
 	return cmd
+}
+
+// replayFile is the --file value for the `replay` subcommand. Package-level
+// so the standaloneRun indirection can find it without threading the
+// cobra.Command through runReplay. replayCmd's RunE sets it before
+// invoking standaloneRun.
+var replayFile string
+
+// replayCmd reads a JSON-lines Flow file produced by --dump-file and
+// re-emits each Flow into the sinks configured under flow.log-path. This
+// is the offline counterpart to the live dump path: dump captures, replay
+// re-sinks. Empty --file or missing sink returns an error (nothing to do).
+//
+// The Flow objects are re-hydrated from disk — ID, Timestamp, and headers
+// are preserved as they were captured. Duration is re-stamped from
+// Timestamp to now if the source had a zero Duration, so re-played flows
+// always show a non-zero elapsed time on the receiving sink.
+func replayCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "replay",
+		Short: "从 JSON-lines Flow 文件回放流量到当前配置的 Flow sinks",
+		Long: "把 dump 出来的 flows.jsonl 逐行读回，通过 flow.log-path 配置的 sink 重新写一遍。\n" +
+			"用法: agent-netx replay --file flows.jsonl [--config config.yml]\n" +
+			"输出: 每行一个 Flow 的写入事件（成功/跳过/错误计数）。\n" +
+			"若 flow.enable=false 或 flow.log-path 为空，replay 会拒绝运行并报错。\n" +
+			"replay 只是把已捕获数据重新写入 sinks，不会真的发出网络请求。",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			file, _ := cmd.Flags().GetString("file")
+			if file == "" {
+				return fmt.Errorf("--file 必填（要回放的 JSON-lines Flow 文件）")
+			}
+			replayFile = file
+			return standaloneRun(cmd, runReplay)
+		},
+	}
+	cmd.Flags().StringP("file", "f", "", "要回放的 JSON-lines Flow 文件路径")
+	return cmd
+}
+
+// runReplay loads the flow dump file and pushes each Flow through the
+// configured sinks. Skips malformed lines (with a counted warning) and
+// always prints a final tally so an operator can see progress + failures.
+func runReplay(ctx context.Context, cfg *config.Config, logRing *web.LogRing) error {
+	sinks := buildFlowSinks(cfg)
+	if len(sinks) == 0 {
+		return fmt.Errorf("flow.enable=false 或 flow.log-path 为空 — 无处可写（先配置 flow 段）")
+	}
+	f, err := os.Open(replayFile)
+	if err != nil {
+		return fmt.Errorf("open replay file: %w", err)
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	// Lines can be large when request/response headers are captured; raise
+	// the default 64KB cap to a few MB to avoid truncating legitimate flows.
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	var ok, skipped, total int
+	for scanner.Scan() {
+		total++
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			skipped++
+			continue
+		}
+		var fl listener.Flow
+		if err := json.Unmarshal(line, &fl); err != nil {
+			skipped++
+			continue
+		}
+		if fl.Duration == 0 {
+			fl.Finalize()
+		}
+		for _, s := range sinks {
+			s.Write(&fl)
+		}
+		ok++
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read replay file: %w", err)
+	}
+	fmt.Printf("replay: %d 行, 写入 %d, 跳过 %d\n", total, ok, skipped)
+	if logRing != nil {
+		logRing.Write(web.INFO, "replay: file=%s lines=%d ok=%d skipped=%d", replayFile, total, ok, skipped)
+	}
+	return nil
 }

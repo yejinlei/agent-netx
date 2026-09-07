@@ -48,19 +48,21 @@ type WireGuardConfig struct {
 }
 
 type Config struct {
-	Listen    Listen        `yaml:"listen"`
-	Mode      string        `yaml:"mode"`
-	Proxies   []ProxyConfig `yaml:"proxies"`
-	Groups    []GroupConfig `yaml:"proxy-groups"`
-	Rules     []string      `yaml:"rules"`
-	TUN       TunConfig     `yaml:"tun"`
-	DNS       DnsConfig     `yaml:"dns"`
-	Web       WebConfig     `yaml:"web"`
-	MITM      MitmConfig    `yaml:"mitm"`
-	N2N       N2NConfig     `yaml:"n2n"`
-	STUNVPN   STUNVPNConfig `yaml:"stunvpv"`
+	Listen    Listen         `yaml:"listen"`
+	Mode      string         `yaml:"mode"`
+	Proxies   []ProxyConfig  `yaml:"proxies"`
+	Groups    []GroupConfig  `yaml:"proxy-groups"`
+	Rules     []string       `yaml:"rules"`
+	TUN       TunConfig      `yaml:"tun"`
+	DNS       DnsConfig      `yaml:"dns"`
+	Web       WebConfig      `yaml:"web"`
+	MITM      MitmConfig     `yaml:"mitm"`
+	Flow      FlowConfig     `yaml:"flow"`
+	Upstream  UpstreamConfig `yaml:"upstream"`
+	N2N       N2NConfig      `yaml:"n2n"`
+	STUNVPN   STUNVPNConfig  `yaml:"stunvpv"`
 	WireGuard WireGuardConfig `yaml:"wireguard"`
-	Agent     AgentConfig   `yaml:"agent"`
+	Agent     AgentConfig    `yaml:"agent"`
 }
 
 type Listen struct {
@@ -152,7 +154,113 @@ type MitmConfig struct {
 	// VerifyUpstream enables certificate validation of the real server on the
 	// re-encrypted upstream TLS session. Default false (relay the client's
 	// trust decision; self-signed internal hosts keep working).
-	VerifyUpstream bool `yaml:"verify-upstream"`
+	VerifyUpstream bool          `yaml:"verify-upstream"`
+	// Rewrite rules applied to decrypted MITM traffic in both directions.
+	// Match is a plain-text substring; Replace is the replacement string.
+	// Applied per-Write/read chunk (boundary-safe for single-chunk bodies).
+	Rewrite []RewriteRule `yaml:"rewrite"`
+	// LogPath, when non-empty, appends JSON-lines of intercepted HTTP
+	// request lines + first response status line to the named file.
+	// Default empty = no disk logging.
+	LogPath string `yaml:"log-path"`
+	// URLActions fire when the decrypted (or plain-HTTP) request path matches
+	// Match. Empty = no URL-based short-circuit. Evaluated after the first
+	// request line is read, BEFORE dialing upstream — so a block/redirect
+	// action never costs an outbound connection.
+	//
+	// Security note: URLActions only affect traffic that this proxy sees. They
+	// do not change the allowlist/skip-hosts interception decision — a blocked
+	// path on a host we never intercept is invisible to us.
+	URLActions []URLAction `yaml:"url-actions"`
+	// ClientCrt / ClientKey load a PEM client certificate pair presented on
+	// the re-encrypted MITM upstream TLS session (mTLS to the origin server).
+	// Rarely used — most HTTPS origins don't require client auth — but
+	// supported for corporate endpoints that pin the caller's identity.
+	// Empty = no client cert on the MITM re-encryption (the default).
+	ClientCrt string `yaml:"client-crt"`
+	ClientKey string `yaml:"client-key"`
+}
+
+// RewriteRule is a simple substring replacement rule.
+type RewriteRule struct {
+	Match   string `yaml:"match"`
+	Replace string `yaml:"replace"`
+}
+
+// URLAction is one pattern→response pair. Match is a substring of the URL
+// path when Regex is false, or a Go RE2 against the full request line when
+// Regex is true. First match wins (rules are evaluated in config order).
+type URLAction struct {
+	// Match — substring when Regex=false (case-sensitive), Go RE2 when
+	// Regex=true. Empty Match is a no-op rule (skipped).
+	Match string `yaml:"match"`
+	// Regex selects RE2 matching against the full request line instead of
+	// substring matching against u.Path.
+	Regex bool `yaml:"regex"`
+	// Action: "block" (return Status+Body as text/html), "redirect"
+	// (302 Location), or "inject" (return Status+Body with custom Headers
+	// — the closest analog to mitmproxy's response-modification addons).
+	// Unknown actions are treated as "block" with a 501 body.
+	Action string `yaml:"action"`
+	// Status is the HTTP status to return. Defaults: block→403,
+	// redirect→302, inject→200.
+	Status int `yaml:"status"`
+	// Body is the response payload for block/inject actions. Empty = no body.
+	// Inject preserves Body byte-for-byte (no HTML wrapping) so callers can
+	// emit JSON, XML, or any content-type.
+	Body string `yaml:"body"`
+	// Location is the 302 target for redirect actions. Empty Location on a
+	// redirect action disables the rule (needs a target to be useful).
+	Location string `yaml:"location"`
+	// Headers is the response header list for inject actions. Each entry is
+	// a full "Name: value" line in wire order (no trailing CRLF). Content-
+	// Length is always derived from Body, and Connection: close is always
+	// appended. Ignored on block/redirect actions.
+	Headers []string `yaml:"headers"`
+}
+
+// UpstreamConfig configures an outbound proxy the agent itself uses when
+// dialing upstream connections (mitmproxy's `-u` flag). Traffic from the
+// agent is chained through this proxy, on top of whatever proxy the Router
+// picks. See proxy.NewUpstreamProxy for the accepted URL schemes.
+type UpstreamConfig struct {
+	// URL is the upstream proxy endpoint: http://, https://, or socks5://
+	// with optional user:pass@. Empty = direct (no chaining).
+	URL string `yaml:"url"`
+	// Timeout is the per-dial timeout to the upstream in seconds. Default 30.
+	Timeout int `yaml:"timeout"`
+	// ClientCrt / ClientKey hold paths to a PEM client certificate and
+	// private key used for mTLS when dialing the upstream proxy. Empty
+	// disables mTLS (normal single-side TLS). Either side may be empty
+	// and the other is ignored (a client cert without a key is
+	// meaningless). cert and key may be in one PEM file — that's the
+	// most common case, and this config accepts the same path for both.
+	ClientCrt string `yaml:"client-crt"`
+	// ClientKey is the PEM private key for ClientCrt. See ClientCrt for
+	// defaulting behavior.
+	ClientKey string `yaml:"client-key"`
+}
+
+// FlowConfig configures the per-request Flow pipeline (see listener/flow.go).
+// A Flow is a serializable snapshot of one request/response cycle and is the
+// mitmproxy Flow analog: the unit lifecycle hooks and downstream consumers
+// attach to.
+type FlowConfig struct {
+	// Enable turns on Flow construction and hook emission. Default false:
+	// the pipeline still works, but no Flow is built and no sink is invoked.
+	// Callers usually enable this automatically whenever LogPath is non-empty.
+	Enable bool `yaml:"enable"`
+	// LogPath, when non-empty, appends one JSON line per completed Flow to
+	// the named file. Requires Enable=true (or LogPath non-empty implies it).
+	LogPath string `yaml:"log-path"`
+	// DBPath, when non-empty, opens a SQLite database at this path and
+	// INSERTs one row per completed Flow. Requires Enable=true. Uses the
+	// modernc.org/sqlite pure-Go driver (no cgo). Coexists with LogPath:
+	// both sinks fire for each Flow so operators can pick one or both.
+	DBPath string `yaml:"db-path"`
+	// MaxFlows is a cap on an in-memory ring buffer for recent Flows (for a
+	// future /flows HTTP endpoint). 0 disables the ring. Not wired yet.
+	MaxFlows int `yaml:"max-flows"`
 }
 
 type AgentConfig struct {
